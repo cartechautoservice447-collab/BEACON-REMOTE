@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <!-- Platform-independent Core contracts: zero Win32, UI, or native driver dependencies -->
+    <TargetFramework>$(BeaconNetTargetFramework)</TargetFramework>
+    <RootNamespace>Beacon.Companion.Core</RootNamespace>
+    <AssemblyName>Beacon.Companion.Core</AssemblyName>
+  </PropertyGroup>
+</Project>

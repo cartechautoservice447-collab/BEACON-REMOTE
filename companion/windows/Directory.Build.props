@@ -1,0 +1,26 @@
+<Project>
+  <PropertyGroup>
+    <!-- .NET 10 LTS baseline across all projects -->
+    <BeaconNetTargetFramework>net10.0</BeaconNetTargetFramework>
+    <!-- Windows-specific adapters (Steps 3.3–3.8) target Windows 11 22H2 SDK while supporting Windows 10 2004 (19041)+ -->
+    <BeaconWindowsTargetFramework>net10.0-windows10.0.22621.0</BeaconWindowsTargetFramework>
+    <BeaconWindowsMinOsVersion>10.0.19041.0</BeaconWindowsMinOsVersion>
+
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>14</LangVersion>
+    <Deterministic>true</Deterministic>
+
+    <!-- Strict compiler warning & static analysis posture -->
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <WarningLevel>9999</WarningLevel>
+    <AnalysisLevel>latest-recommended</AnalysisLevel>
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(TargetPlatformIdentifier)' == 'Windows'">
+    <SupportedOSPlatformVersion>$(BeaconWindowsMinOsVersion)</SupportedOSPlatformVersion>
+    <TargetPlatformMinVersion>$(BeaconWindowsMinOsVersion)</TargetPlatformMinVersion>
+  </PropertyGroup>
+</Project>
