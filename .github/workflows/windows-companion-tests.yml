@@ -1,0 +1,62 @@
+name: Windows Companion (.NET 10) Tests
+
+on:
+  push:
+    paths:
+      - "companion/windows/**"
+      - ".github/workflows/windows-companion-tests.yml"
+  pull_request:
+    paths:
+      - "companion/windows/**"
+      - ".github/workflows/windows-companion-tests.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-windows-companion:
+    name: Build & Test (Windows / .NET 10)
+    runs-on: windows-latest
+
+    env:
+      DOTNET_NOLOGO: "true"
+      DOTNET_CLI_TELEMETRY_OPTOUT: "true"
+      TEST_PROJECT: companion/windows/tests/Beacon.Companion.Tests/Beacon.Companion.Tests.csproj
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 10 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Show .NET SDK info
+        run: dotnet --info
+
+      - name: Restore NuGet dependencies
+        run: dotnet restore "${{ env.TEST_PROJECT }}"
+
+      - name: Build Core and Tests (Release)
+        run: dotnet build "${{ env.TEST_PROJECT }}" --configuration Release --no-restore
+
+      - name: Run xUnit tests and generate TRX report
+        id: test
+        run: >
+          dotnet test "${{ env.TEST_PROJECT }}"
+          --configuration Release
+          --no-build
+          --verbosity normal
+          --logger "trx;LogFileName=beacon-companion-tests.trx"
+          --results-directory TestResults
+
+      - name: Upload TRX test report artifact
+        if: ${{ steps.test.outcome == 'success' || steps.test.outcome == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: beacon-companion-windows-trx
+          path: TestResults/**/*.trx
+          if-no-files-found: error
+          retention-days: 30
