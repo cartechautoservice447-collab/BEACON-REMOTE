@@ -78,17 +78,7 @@ public sealed record CompanionOptions
     public static bool IsAllowedServerOrigin(Uri origin)
     {
         ArgumentNullException.ThrowIfNull(origin);
-        if (!origin.IsAbsoluteUri)
-        {
-            return false;
-        }
-
-        if (origin.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
-        {
-            return true;
-        }
-
-        return origin.Scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) && origin.IsLoopback;
+        return Security.ServerOriginValidator.IsAllowedServerOrigin(origin, allowDevelopmentLoopbackHttp: true);
     }
 }
 

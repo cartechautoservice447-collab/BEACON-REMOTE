@@ -157,3 +157,167 @@ describe("cross-language TypeScript <-> C# protocol contract", () => {
     }
   });
 });
+
+type SharedPairingFixture = {
+  endpointPath: string;
+  qrSchema: { type: string; version: number };
+  validQrPayloads: Array<{
+    name: string;
+    json: string;
+    expectedServer: string;
+    expectedPairingId: string;
+  }>;
+  invalidQrPayloads: Array<{ name: string; json: string }>;
+  validPinRequests: Array<{
+    name: string;
+    json: string;
+  }>;
+  validQrRequests: Array<{
+    name: string;
+    json: string;
+  }>;
+  invalidPairRequests: Array<{ name: string; json: string }>;
+  serverResponses: {
+    confirmed200: string;
+    invalidCode401: string;
+    expired410: string;
+    tooManyAttempts429: string;
+    serverError500: string;
+  };
+};
+
+const PAIRING_FIXTURE_PATH = path.resolve(
+  process.cwd(),
+  "companion/windows/tests/Beacon.Companion.Tests/Fixtures/pairing-protocol-contract.json",
+);
+
+const pairingFixture: SharedPairingFixture = JSON.parse(readFileSync(PAIRING_FIXTURE_PATH, "utf8"));
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const BASE64URL_TOKEN_RE = /^[A-Za-z0-9_-]{20,128}$/;
+
+function isValidBackendPairingBody(rawJson: string): boolean {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawJson);
+  } catch {
+    return false;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+  const obj = parsed as Record<string, unknown>;
+  const device = obj["device"];
+  if (!device || typeof device !== "object" || Array.isArray(device)) return false;
+  const devObj = device as Record<string, unknown>;
+  const validDevice =
+    typeof devObj["name"] === "string" &&
+    devObj["name"].trim().length >= 1 &&
+    devObj["name"].trim().length <= 64 &&
+    typeof devObj["os"] === "string" &&
+    devObj["os"].trim().length >= 1 &&
+    devObj["os"].trim().length <= 64 &&
+    typeof devObj["agent_version"] === "string" &&
+    devObj["agent_version"].trim().length >= 1 &&
+    devObj["agent_version"].trim().length <= 32;
+  if (!validDevice) return false;
+
+  const hasCode = "code" in obj;
+  const hasPairingId = "pairing_id" in obj;
+  const hasToken = "token" in obj;
+
+  if (hasCode && !hasPairingId && !hasToken) {
+    return typeof obj["code"] === "string" && /^\d{6}$/.test(obj["code"]);
+  }
+
+  if (!hasCode && hasPairingId && hasToken) {
+    return (
+      typeof obj["pairing_id"] === "string" &&
+      UUID_RE.test(obj["pairing_id"]) &&
+      typeof obj["token"] === "string" &&
+      obj["token"].length >= 20 &&
+      obj["token"].length <= 128
+    );
+  }
+
+  return false;
+}
+
+function isValidFrontendQrPayload(rawJson: string): boolean {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawJson);
+  } catch {
+    return false;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+  const obj = parsed as Record<string, unknown>;
+  if (obj["type"] !== "beacon-pair" || obj["v"] !== 1) return false;
+  if (
+    typeof obj["server"] !== "string" ||
+    typeof obj["pairing_id"] !== "string" ||
+    typeof obj["token"] !== "string"
+  ) {
+    return false;
+  }
+  if (!UUID_RE.test(obj["pairing_id"]) || !BASE64URL_TOKEN_RE.test(obj["token"])) return false;
+
+  let url: URL;
+  try {
+    url = new URL(obj["server"]);
+  } catch {
+    return false;
+  }
+  if (url.username || url.password || url.search || url.hash) return false;
+  if (url.pathname !== "/" && url.pathname !== "") return false;
+  if (url.protocol === "https:") return true;
+  if (
+    url.protocol === "http:" &&
+    (url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]")
+  ) {
+    return true;
+  }
+  return false;
+}
+
+describe("cross-language TypeScript <-> C# Step 3.3 pairing protocol contract", () => {
+  test("shared pairing fixture matches frontend QR generator and backend /api/public/agent/pair schema", () => {
+    expect(pairingFixture.endpointPath).toBe("/api/public/agent/pair");
+    expect(pairingFixture.qrSchema).toEqual({ type: "beacon-pair", version: 1 });
+
+    for (const qr of pairingFixture.validQrPayloads) {
+      expect(isValidFrontendQrPayload(qr.json), qr.name).toBe(true);
+    }
+
+    for (const qr of pairingFixture.invalidQrPayloads) {
+      expect(isValidFrontendQrPayload(qr.json), qr.name).toBe(false);
+    }
+
+    for (const req of pairingFixture.validPinRequests) {
+      expect(isValidBackendPairingBody(req.json), req.name).toBe(true);
+    }
+
+    for (const req of pairingFixture.validQrRequests) {
+      expect(isValidBackendPairingBody(req.json), req.name).toBe(true);
+    }
+
+    for (const req of pairingFixture.invalidPairRequests) {
+      expect(isValidBackendPairingBody(req.json), req.name).toBe(false);
+    }
+
+    const ok200 = JSON.parse(pairingFixture.serverResponses.confirmed200) as Record<
+      string,
+      unknown
+    >;
+    expect(UUID_RE.test(String(ok200["device_id"]))).toBe(true);
+    expect(BASE64URL_TOKEN_RE.test(String(ok200["device_token"]))).toBe(true);
+
+    for (const errJson of [
+      pairingFixture.serverResponses.invalidCode401,
+      pairingFixture.serverResponses.expired410,
+      pairingFixture.serverResponses.tooManyAttempts429,
+      pairingFixture.serverResponses.serverError500,
+    ]) {
+      const parsed = JSON.parse(errJson) as Record<string, unknown>;
+      expect(typeof parsed["error"]).toBe("string");
+    }
+  });
+});

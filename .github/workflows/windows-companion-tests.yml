@@ -13,6 +13,8 @@ on:
       - "src/lib/remote/protocol-contract.test.ts"
       - "src/lib/remote/protocol.ts"
       - "src/lib/remote/keys.ts"
+      - "src/lib/pairing.ts"
+      - "src/routes/api/public/agent/pair.ts"
   pull_request:
     branches:
       - main
@@ -25,6 +27,8 @@ on:
       - "src/lib/remote/protocol-contract.test.ts"
       - "src/lib/remote/protocol.ts"
       - "src/lib/remote/keys.ts"
+      - "src/lib/pairing.ts"
+      - "src/routes/api/public/agent/pair.ts"
   workflow_dispatch:
 
 permissions:

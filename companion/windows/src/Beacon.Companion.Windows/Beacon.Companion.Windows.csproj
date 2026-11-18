@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <!-- Windows-specific infrastructure adapters (DPAPI in Step 3.3, DXGI in Step 3.5, SendInput in Step 3.6) -->
+    <TargetFramework>$(BeaconWindowsTargetFramework)</TargetFramework>
+    <RootNamespace>Beacon.Companion.Windows</RootNamespace>
+    <AssemblyName>Beacon.Companion.Windows</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="10.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Beacon.Companion.Core\Beacon.Companion.Core.csproj" />
+  </ItemGroup>
+</Project>

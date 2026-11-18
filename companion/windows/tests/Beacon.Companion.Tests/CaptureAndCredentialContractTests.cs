@@ -69,13 +69,18 @@ public sealed class CaptureAndCredentialContractTests
     [Fact]
     public void DeviceCredentialClearsTokenBufferOnDisposeAndValidatesOrigin()
     {
+        var deviceId = Guid.NewGuid();
         using var cred = new DeviceCredential(
-            Guid.NewGuid(),
+            deviceId,
             new Uri("https://beacon.example.com"),
             "0123456789abcdefghij",
             DateTimeOffset.UtcNow);
 
         Assert.Equal("0123456789abcdefghij", cred.Token.ToString());
+        Assert.DoesNotContain("0123456789abcdefghij", cred.ToString(), StringComparison.Ordinal);
+        Assert.Contains("[REDACTED]", cred.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain("0123456789abcdefghij", cred.TokenBuffer.ToString(), StringComparison.Ordinal);
+
         cred.Dispose();
         Assert.True(cred.IsDisposed);
         Assert.Throws<ObjectDisposedException>(() => _ = cred.Token.Length);
@@ -84,6 +89,18 @@ public sealed class CaptureAndCredentialContractTests
             Guid.NewGuid(),
             new Uri("https://beacon.example.com"),
             "short",
+            DateTimeOffset.UtcNow));
+
+        Assert.Throws<ArgumentException>(() => new DeviceCredential(
+            Guid.NewGuid(),
+            new Uri("https://beacon.example.com/custom/path"),
+            "0123456789abcdefghij",
+            DateTimeOffset.UtcNow));
+
+        Assert.Throws<ArgumentException>(() => new DeviceCredential(
+            Guid.NewGuid(),
+            new Uri("https://user:pass@beacon.example.com"),
+            "0123456789abcdefghij",
             DateTimeOffset.UtcNow));
     }
 
