@@ -1,0 +1,207 @@
+{
+  "eventTypes": [
+    "pointer.move.abs",
+    "pointer.button",
+    "pointer.wheel",
+    "key",
+    "input.reset"
+  ],
+  "mouseButtons": [
+    "left",
+    "right",
+    "middle"
+  ],
+  "inputActions": [
+    "down",
+    "up"
+  ],
+  "coordinateRange": {
+    "min": 0,
+    "max": 1
+  },
+  "modifierKeyCodes": [
+    "ShiftLeft",
+    "ControlLeft",
+    "AltLeft",
+    "MetaLeft"
+  ],
+  "lockKeyCodes": [
+    "CapsLock"
+  ],
+  "allKeyCodes": [
+    "KeyA", "KeyB", "KeyC", "KeyD", "KeyE", "KeyF", "KeyG", "KeyH", "KeyI", "KeyJ",
+    "KeyK", "KeyL", "KeyM", "KeyN", "KeyO", "KeyP", "KeyQ", "KeyR", "KeyS", "KeyT",
+    "KeyU", "KeyV", "KeyW", "KeyX", "KeyY", "KeyZ",
+    "Digit1", "Digit2", "Digit3", "Digit4", "Digit5",
+    "Digit6", "Digit7", "Digit8", "Digit9", "Digit0",
+    "F1", "F2", "F3", "F4", "F5", "F6",
+    "F7", "F8", "F9", "F10", "F11", "F12",
+    "Escape", "Tab", "CapsLock",
+    "ShiftLeft", "ControlLeft", "AltLeft", "MetaLeft",
+    "Space", "Enter", "Backspace", "Delete", "Insert",
+    "Home", "End", "PageUp", "PageDown",
+    "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
+    "PrintScreen",
+    "Minus", "Equal", "BracketLeft", "BracketRight",
+    "Backslash", "Semicolon", "Quote", "Comma", "Period", "Slash", "Backquote"
+  ],
+  "validPayloads": [
+    {
+      "name": "move-center",
+      "json": "{\"type\":\"pointer.move.abs\",\"x\":0.5,\"y\":0.5}",
+      "expectedType": "pointer.move.abs"
+    },
+    {
+      "name": "move-boundaries",
+      "json": "{\"type\":\"pointer.move.abs\",\"x\":0,\"y\":1}",
+      "expectedType": "pointer.move.abs"
+    },
+    {
+      "name": "move-out-of-order-discriminator",
+      "json": "{\"x\":0.25,\"y\":0.75,\"type\":\"pointer.move.abs\"}",
+      "expectedType": "pointer.move.abs"
+    },
+    {
+      "name": "button-left-down",
+      "json": "{\"type\":\"pointer.button\",\"button\":\"left\",\"action\":\"down\",\"x\":0.1,\"y\":0.9}",
+      "expectedType": "pointer.button"
+    },
+    {
+      "name": "button-right-up",
+      "json": "{\"type\":\"pointer.button\",\"button\":\"right\",\"action\":\"up\",\"x\":0.95,\"y\":0.05}",
+      "expectedType": "pointer.button"
+    },
+    {
+      "name": "button-middle-down",
+      "json": "{\"type\":\"pointer.button\",\"button\":\"middle\",\"action\":\"down\",\"x\":0.5,\"y\":0.5}",
+      "expectedType": "pointer.button"
+    },
+    {
+      "name": "wheel-positive-vertical",
+      "json": "{\"type\":\"pointer.wheel\",\"dx\":0,\"dy\":42.5}",
+      "expectedType": "pointer.wheel"
+    },
+    {
+      "name": "wheel-negative-vertical",
+      "json": "{\"type\":\"pointer.wheel\",\"dx\":0,\"dy\":-35.25}",
+      "expectedType": "pointer.wheel"
+    },
+    {
+      "name": "wheel-horizontal-fractional",
+      "json": "{\"type\":\"pointer.wheel\",\"dx\":-0.25,\"dy\":0.125}",
+      "expectedType": "pointer.wheel"
+    },
+    {
+      "name": "key-normal-down",
+      "json": "{\"type\":\"key\",\"code\":\"KeyA\",\"action\":\"down\"}",
+      "expectedType": "key"
+    },
+    {
+      "name": "key-modifier-up",
+      "json": "{\"type\":\"key\",\"code\":\"ControlLeft\",\"action\":\"up\"}",
+      "expectedType": "key"
+    },
+    {
+      "name": "key-lock-down",
+      "json": "{\"type\":\"key\",\"code\":\"CapsLock\",\"action\":\"down\"}",
+      "expectedType": "key"
+    },
+    {
+      "name": "input-reset",
+      "json": "{\"type\":\"input.reset\"}",
+      "expectedType": "input.reset"
+    }
+  ],
+  "invalidWirePayloads": [
+    {
+      "name": "malformed-json",
+      "json": "{not-valid-json",
+      "stage": "parse"
+    },
+    {
+      "name": "non-object-root",
+      "json": "[\"pointer.move.abs\", 0.5, 0.5]",
+      "stage": "parse"
+    },
+    {
+      "name": "trailing-garbage",
+      "json": "{\"type\":\"input.reset\"} 123",
+      "stage": "parse"
+    },
+    {
+      "name": "missing-discriminator",
+      "json": "{\"x\":0.5,\"y\":0.5}",
+      "stage": "parse"
+    },
+    {
+      "name": "unknown-event-type",
+      "json": "{\"type\":\"pointer.move.rel\",\"dx\":10,\"dy\":5}",
+      "stage": "parse"
+    },
+    {
+      "name": "uppercase-event-type",
+      "json": "{\"type\":\"Pointer.Move.Abs\",\"x\":0.5,\"y\":0.5}",
+      "stage": "parse"
+    },
+    {
+      "name": "missing-y-on-move",
+      "json": "{\"type\":\"pointer.move.abs\",\"x\":0.5}",
+      "stage": "parse"
+    },
+    {
+      "name": "missing-button-on-button-event",
+      "json": "{\"type\":\"pointer.button\",\"action\":\"down\",\"x\":0.5,\"y\":0.5}",
+      "stage": "parse"
+    },
+    {
+      "name": "missing-dy-on-wheel",
+      "json": "{\"type\":\"pointer.wheel\",\"dx\":12}",
+      "stage": "parse"
+    },
+    {
+      "name": "missing-code-on-key",
+      "json": "{\"type\":\"key\",\"action\":\"down\"}",
+      "stage": "parse"
+    },
+    {
+      "name": "string-coordinate-type",
+      "json": "{\"type\":\"pointer.move.abs\",\"x\":\"0.5\",\"y\":0.5}",
+      "stage": "parse"
+    },
+    {
+      "name": "numeric-button-enum",
+      "json": "{\"type\":\"pointer.button\",\"button\":0,\"action\":\"down\",\"x\":0.5,\"y\":0.5}",
+      "stage": "parse"
+    },
+    {
+      "name": "uppercase-button-enum",
+      "json": "{\"type\":\"pointer.button\",\"button\":\"LEFT\",\"action\":\"down\",\"x\":0.5,\"y\":0.5}",
+      "stage": "parse"
+    },
+    {
+      "name": "uppercase-action-enum",
+      "json": "{\"type\":\"key\",\"code\":\"KeyA\",\"action\":\"DOWN\"}",
+      "stage": "parse"
+    },
+    {
+      "name": "coordinate-below-zero",
+      "json": "{\"type\":\"pointer.move.abs\",\"x\":-0.01,\"y\":0.5}",
+      "stage": "validate"
+    },
+    {
+      "name": "coordinate-above-one",
+      "json": "{\"type\":\"pointer.button\",\"button\":\"left\",\"action\":\"down\",\"x\":0.5,\"y\":1.01}",
+      "stage": "validate"
+    },
+    {
+      "name": "unknown-key-code",
+      "json": "{\"type\":\"key\",\"code\":\"F24\",\"action\":\"down\"}",
+      "stage": "validate"
+    },
+    {
+      "name": "extreme-wheel-delta",
+      "json": "{\"type\":\"pointer.wheel\",\"dx\":0,\"dy\":1000000}",
+      "stage": "validate"
+    }
+  ]
+}

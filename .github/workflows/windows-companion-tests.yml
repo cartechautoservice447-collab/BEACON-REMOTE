@@ -2,13 +2,23 @@ name: Windows Companion (.NET 10) Tests
 
 on:
   push:
+    branches:
+      - main
     paths:
       - "companion/windows/**"
       - ".github/workflows/windows-companion-tests.yml"
+      - "src/lib/remote/protocol-contract.test.ts"
+      - "src/lib/remote/protocol.ts"
+      - "src/lib/remote/keys.ts"
   pull_request:
+    branches:
+      - main
     paths:
       - "companion/windows/**"
       - ".github/workflows/windows-companion-tests.yml"
+      - "src/lib/remote/protocol-contract.test.ts"
+      - "src/lib/remote/protocol.ts"
+      - "src/lib/remote/keys.ts"
   workflow_dispatch:
 
 permissions:
@@ -16,7 +26,7 @@ permissions:
 
 jobs:
   test-windows-companion:
-    name: Build & Test (Windows / .NET 10)
+    name: Build & Test (Windows / .NET 10 + TS Contract)
     runs-on: windows-latest
 
     env:
@@ -60,3 +70,17 @@ jobs:
           path: TestResults/**/*.trx
           if-no-files-found: error
           retention-days: 30
+
+      - name: Setup Node.js
+        if: ${{ !cancelled() }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Node.js dependencies
+        if: ${{ !cancelled() }}
+        run: npm install --no-audit --no-fund
+
+      - name: Run TypeScript cross-language protocol contract tests
+        if: ${{ !cancelled() }}
+        run: npx vitest run src/lib/remote/protocol-contract.test.ts

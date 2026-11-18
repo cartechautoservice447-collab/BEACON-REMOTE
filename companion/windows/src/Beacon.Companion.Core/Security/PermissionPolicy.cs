@@ -35,6 +35,11 @@ public sealed record SessionApprovalDecision(
     PermissionMode GrantedMode,
     string Reason);
 
+public sealed record SessionAuthorizationContext(
+    SessionState State,
+    PermissionMode Mode,
+    bool IsConnectionAuthenticated = true);
+
 public enum InputRejectionReason
 {
     None = 0,
@@ -45,6 +50,7 @@ public enum InputRejectionReason
     InvalidCoordinates = 5,
     InvalidWheelDelta = 6,
     DisallowedKeyCode = 7,
+    SessionNotAuthenticated = 8,
 }
 
 public sealed record InputPermissionDecision(
@@ -60,26 +66,60 @@ public sealed record InputPermissionDecision(
 
 public interface IInputPermissionEvaluator
 {
+    /// <summary>
+    /// Pure session authorization check (authentication + session state + permission mode).
+    /// Does not inspect syntactic coordinate/key/wheel bounds; keeps validation and authorization separate.
+    /// </summary>
+    InputPermissionDecision Authorize(SessionAuthorizationContext context, RemoteInputEvent command);
+
+    /// <summary>
+    /// Combined authorization + command validation helper for legacy callers.
+    /// </summary>
     InputPermissionDecision Evaluate(SessionState state, PermissionMode mode, RemoteInputEvent command);
 }
 
 /// <summary>
-/// Pure security evaluator separating input authorization decisions from Windows OS execution.
-/// Normalized coordinates must be finite and within [0, 1]; wheel deltas must be finite;
-/// keys must exist in <see cref="KeyCodeCatalog"/>; <c>input.reset</c> is always permitted so held state can unwind cleanly.
+/// Separates session/connection authorization from OS injection and wire validation.
+/// <c>input.reset</c> is processed as a safety cleanup command ONLY within an authenticated
+/// and authorized session (Active, Paused, or LockedOrUnavailable), never bypassing authentication,
+/// owner approval, or post-termination blocking.
 /// </summary>
 public sealed class InputPermissionEvaluator : IInputPermissionEvaluator
 {
-    public InputPermissionDecision Evaluate(SessionState state, PermissionMode mode, RemoteInputEvent command)
+    private readonly IInputCommandValidator _validator;
+
+    public InputPermissionEvaluator(IInputCommandValidator? validator = null)
     {
+        _validator = validator ?? new InputCommandValidator();
+    }
+
+    public InputPermissionDecision Authorize(SessionAuthorizationContext context, RemoteInputEvent command)
+    {
+        ArgumentNullException.ThrowIfNull(context);
         ArgumentNullException.ThrowIfNull(command);
+
+        if (!context.IsConnectionAuthenticated)
+        {
+            return InputPermissionDecision.Deny(
+                InputRejectionReason.SessionNotAuthenticated,
+                "Connection is not authenticated.");
+        }
 
         if (command is InputResetEvent)
         {
-            return InputPermissionDecision.Allow();
+            return context.State switch
+            {
+                SessionState.ActiveFullControl
+                    or SessionState.ActiveViewOnly
+                    or SessionState.Paused
+                    or SessionState.LockedOrUnavailable => InputPermissionDecision.Allow(),
+                _ => InputPermissionDecision.Deny(
+                    InputRejectionReason.SessionNotActive,
+                    "input.reset requires an authenticated and authorized session."),
+            };
         }
 
-        switch (state)
+        switch (context.State)
         {
             case SessionState.Paused:
                 return InputPermissionDecision.Deny(InputRejectionReason.SessionPaused, "Remote control is paused.");
@@ -95,45 +135,37 @@ public sealed class InputPermissionEvaluator : IInputPermissionEvaluator
                 break;
         }
 
-        if (mode != PermissionMode.FullControl)
+        if (context.Mode != PermissionMode.FullControl)
         {
             return InputPermissionDecision.Deny(InputRejectionReason.ViewOnlyMode, "PermissionMode is ViewOnly.");
         }
 
-        return command switch
+        return InputPermissionDecision.Allow();
+    }
+
+    public InputPermissionDecision Evaluate(SessionState state, PermissionMode mode, RemoteInputEvent command)
+    {
+        var authDecision = Authorize(new SessionAuthorizationContext(state, mode, IsConnectionAuthenticated: true), command);
+        if (!authDecision.Allowed)
         {
-            PointerMoveAbsEvent move => ValidateNormalizedCoords(move.X, move.Y),
-            PointerButtonEvent btn => ValidateNormalizedCoords(btn.X, btn.Y),
-            PointerWheelEvent wheel => ValidateWheel(wheel.Dx, wheel.Dy),
-            KeyInputEvent key => KeyCodeCatalog.IsAllowed(key.Code)
-                ? InputPermissionDecision.Allow()
-                : InputPermissionDecision.Deny(InputRejectionReason.DisallowedKeyCode, $"Key code '{key.Code}' is not in the allowed catalog."),
-            _ => InputPermissionDecision.Deny(InputRejectionReason.SessionNotActive, "Unsupported input command."),
+            return authDecision;
+        }
+
+        var validation = _validator.Validate(command);
+        if (validation.IsValid)
+        {
+            return InputPermissionDecision.Allow();
+        }
+
+        var mappedReason = validation.Reason switch
+        {
+            InputValidationFailureReason.InvalidPointerCoordinates => InputRejectionReason.InvalidCoordinates,
+            InputValidationFailureReason.InvalidWheelDelta or InputValidationFailureReason.WheelDeltaOutOfBounds => InputRejectionReason.InvalidWheelDelta,
+            InputValidationFailureReason.DisallowedKeyCode => InputRejectionReason.DisallowedKeyCode,
+            _ => InputRejectionReason.SessionNotActive,
         };
-    }
 
-    private static InputPermissionDecision ValidateNormalizedCoords(double x, double y)
-    {
-        if (!double.IsFinite(x) || !double.IsFinite(y) || x < 0.0 || x > 1.0 || y < 0.0 || y > 1.0)
-        {
-            return InputPermissionDecision.Deny(
-                InputRejectionReason.InvalidCoordinates,
-                "Pointer coordinates must be finite numbers in [0, 1].");
-        }
-
-        return InputPermissionDecision.Allow();
-    }
-
-    private static InputPermissionDecision ValidateWheel(double dx, double dy)
-    {
-        if (!double.IsFinite(dx) || !double.IsFinite(dy))
-        {
-            return InputPermissionDecision.Deny(
-                InputRejectionReason.InvalidWheelDelta,
-                "Wheel deltas must be finite numbers.");
-        }
-
-        return InputPermissionDecision.Allow();
+        return InputPermissionDecision.Deny(mappedReason, validation.Detail ?? "Invalid input command.");
     }
 }
 
@@ -146,6 +178,9 @@ public sealed class SessionStateMachine
     public SessionState State { get; private set; } = SessionState.Idle;
     public PermissionMode Mode { get; private set; } = PermissionMode.ViewOnly;
     public Guid? ActiveSessionId { get; private set; }
+
+    public SessionAuthorizationContext GetAuthorizationContext(bool isConnectionAuthenticated = true) =>
+        new(State, Mode, isConnectionAuthenticated);
 
     public SessionApprovalDecision BeginSession(
         SessionApprovalRequest request,
@@ -197,7 +232,7 @@ public sealed class SessionStateMachine
 
     /// <summary>
     /// Completes interactive laptop-owner consent when awaiting approval.
-    /// Returns false if owner declined (transitioning to Terminated or ViewOnly).
+    /// Returns false if owner declined (transitioning to Terminated).
     /// </summary>
     public bool ResolveOwnerApproval(bool approved, PermissionMode grantedMode = PermissionMode.FullControl)
     {

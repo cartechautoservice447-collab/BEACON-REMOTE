@@ -63,14 +63,35 @@ public sealed class InputPermissionEvaluatorTests
     }
 
     [Theory]
+    [InlineData(SessionState.ActiveFullControl, PermissionMode.FullControl)]
     [InlineData(SessionState.ActiveViewOnly, PermissionMode.ViewOnly)]
     [InlineData(SessionState.Paused, PermissionMode.FullControl)]
     [InlineData(SessionState.LockedOrUnavailable, PermissionMode.FullControl)]
-    [InlineData(SessionState.Terminated, PermissionMode.ViewOnly)]
-    public void AlwaysAllowsInputResetSoHeldInputsCanReleaseCleanly(SessionState state, PermissionMode mode)
+    public void AllowsInputResetWithinAuthenticatedAuthorizedSession(SessionState state, PermissionMode mode)
     {
-        var decision = _evaluator.Evaluate(state, mode, new InputResetEvent());
+        var decision = _evaluator.Authorize(
+            new SessionAuthorizationContext(state, mode, IsConnectionAuthenticated: true),
+            new InputResetEvent());
         Assert.True(decision.Allowed);
+    }
+
+    [Theory]
+    [InlineData(SessionState.Idle, PermissionMode.ViewOnly, true, InputRejectionReason.SessionNotActive)]
+    [InlineData(SessionState.AwaitingOwnerApproval, PermissionMode.FullControl, true, InputRejectionReason.SessionNotActive)]
+    [InlineData(SessionState.Terminated, PermissionMode.ViewOnly, true, InputRejectionReason.SessionNotActive)]
+    [InlineData(SessionState.ActiveFullControl, PermissionMode.FullControl, false, InputRejectionReason.SessionNotAuthenticated)]
+    public void RejectsInputResetWhenUnauthenticatedOrOutsideAuthorizedSession(
+        SessionState state,
+        PermissionMode mode,
+        bool authenticated,
+        InputRejectionReason expectedReason)
+    {
+        var decision = _evaluator.Authorize(
+            new SessionAuthorizationContext(state, mode, IsConnectionAuthenticated: authenticated),
+            new InputResetEvent());
+
+        Assert.False(decision.Allowed);
+        Assert.Equal(expectedReason, decision.Reason);
     }
 
     [Fact]

@@ -19,4 +19,10 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\Beacon.Companion.Core\Beacon.Companion.Core.csproj" />
   </ItemGroup>
+
+  <ItemGroup>
+    <None Update="Fixtures\**\*.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
 </Project>
