@@ -71,7 +71,7 @@ public sealed class HeartbeatSupervisorTests
         string? capturedAuthParam = null;
         bool? capturedNoStore = null;
 
-        using var handler = new StubHttpMessageHandler((req, _) =>
+        using var handler = new StubHttpMessageHandler((req, unusedBody) =>
         {
             capturedUri = req.RequestUri;
             capturedMethod = req.Method;
@@ -174,7 +174,7 @@ public sealed class HeartbeatSupervisorTests
         await SaveSeedCredentialAsync(store);
 
         var attempt = 0;
-        using var handler = new AsyncStubHttpMessageHandler(async (_, ct) =>
+        using var handler = new AsyncStubHttpMessageHandler(async (unusedReq, ct) =>
         {
             var current = Interlocked.Increment(ref attempt);
             if (current == 1)
@@ -507,7 +507,7 @@ public sealed class HeartbeatSupervisorTests
         await using var supervisor = new HeartbeatSupervisor(store, client, new InMemoryRevocationTombstoneStore());
 
         var revokedSignal = new TaskCompletionSource<DeviceRevokedEventArgs>(TaskCreationOptions.RunContinuationsAsynchronously);
-        supervisor.RevocationConfirmed += (_, args) => _ = revokedSignal.TrySetResult(args);
+        supervisor.RevocationConfirmed += (sender, args) => _ = revokedSignal.TrySetResult(args);
 
         await supervisor.StartAsync();
         var args = await revokedSignal.Task.WaitAsync(TimeSpan.FromSeconds(5));
@@ -625,7 +625,7 @@ public sealed class HeartbeatSupervisorTests
         await SaveSeedCredentialAsync(store);
 
         var inFlightStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        using var handler = new AsyncStubHttpMessageHandler(async (_, ct) =>
+        using var handler = new AsyncStubHttpMessageHandler(async (unusedReq, ct) =>
         {
             _ = inFlightStarted.TrySetResult();
             await Task.Delay(Timeout.InfiniteTimeSpan, ct);
@@ -759,7 +759,7 @@ public sealed class HeartbeatSupervisorTests
         var call2Release = new TaskCompletionSource<HttpStatusCode>(TaskCreationOptions.RunContinuationsAsynchronously);
 
         var callIndex = 0;
-        var stubClient = new DelegateHeartbeatClient(async (cred, _) =>
+        var stubClient = new DelegateHeartbeatClient(async (cred, unusedCt) =>
         {
             var idx = Interlocked.Increment(ref callIndex);
             var tcs = idx == 1 ? call1Release : call2Release;
@@ -882,7 +882,7 @@ public sealed class HeartbeatSupervisorTests
         using var store = new InMemoryCredentialStore();
         await SaveSeedCredentialAsync(store, DeviceIdA, TokenA);
 
-        using var handler = new StubHttpMessageHandler((req, _) =>
+        using var handler = new StubHttpMessageHandler((req, unusedBody) =>
         {
             var token = req.Headers.Authorization?.Parameter;
             if (token == TokenA)
@@ -1050,7 +1050,7 @@ public sealed class HeartbeatSupervisorTests
     // 1. Startup never authorizes a credential before server verification.
     // 2. Fresh pairing (AcknowledgeFreshPairingAsync) remains unverified until a successful heartbeat.
     [Fact]
-    public async Task Argon_3_4_001_StartupAndFreshPairingRemainPendingVerificationUntilServerHeartbeatSucceeds()
+    public async Task Argon34001StartupAndFreshPairingRemainPendingVerificationUntilServerHeartbeatSucceeds()
     {
         using var store = new InMemoryCredentialStore();
         await SaveSeedCredentialAsync(store, DeviceIdA, TokenA);
@@ -1126,7 +1126,7 @@ public sealed class HeartbeatSupervisorTests
     // 19. Fresh pairing with a new DeviceId works.
     // 20. Old revoked DeviceId cannot regain authorization.
     [Fact]
-    public async Task Argon_3_4_002_FailedCredentialDeletionAndProcessRestartRemainBlockedByDurableTombstoneUntilNewDeviceIdPaired()
+    public async Task Argon34002FailedCredentialDeletionAndProcessRestartRemainBlockedByDurableTombstoneUntilNewDeviceIdPaired()
     {
         var tempDir = Path.Combine(Path.GetTempPath(), $"BeaconStep34_Tombstone_{Guid.NewGuid():N}");
         Directory.CreateDirectory(tempDir);
@@ -1159,7 +1159,7 @@ public sealed class HeartbeatSupervisorTests
                     CredentialDeleteRetryDelay = TimeSpan.FromMilliseconds(5),
                 }))
             {
-                supervisor1.RevocationConfirmed += (_, e) => capturedRevokedEvent = e;
+                supervisor1.RevocationConfirmed += (sender, e) => capturedRevokedEvent = e;
 
                 var revokeRes = await supervisor1.TriggerHeartbeatNowAsync();
                 Assert.Equal(HeartbeatOutcomeKind.Revoked, revokeRes.Outcome);
@@ -1185,7 +1185,7 @@ public sealed class HeartbeatSupervisorTests
             Assert.True(await dpapiTombstoneStore2.IsRevokedAsync(DeviceIdA));
 
             var networkCallsAfterRestart = 0;
-            using var handler2 = new StubHttpMessageHandler((req, _) =>
+            using var handler2 = new StubHttpMessageHandler((req, unusedBody) =>
             {
                 _ = Interlocked.Increment(ref networkCallsAfterRestart);
                 var token = req.Headers.Authorization?.Parameter;
@@ -1236,7 +1236,7 @@ public sealed class HeartbeatSupervisorTests
     }
 
     [Fact]
-    public async Task Argon_3_4_002_CorruptedDpapiRevocationTombstoneFileFailsClosed()
+    public async Task Argon34002CorruptedDpapiRevocationTombstoneFileFailsClosed()
     {
         var tempDir = Path.Combine(Path.GetTempPath(), $"BeaconStep34_TombstoneCorrupt_{Guid.NewGuid():N}");
         Directory.CreateDirectory(tempDir);
@@ -1293,7 +1293,7 @@ public sealed class HeartbeatSupervisorTests
     [InlineData("""{"error":"unauthorized","error":"proxy_override"}""")]
     [InlineData("""{"error":"proxy_override","error":"unauthorized"}""")]
     [InlineData("""{"error":"unauthorized"} trailing""")]
-    public async Task Argon_3_4_003_And_004_UntrustedOrMalformed401ResponsesDoNotRevokeOrDeleteCredentials(
+    public async Task Argon34003And004UntrustedOrMalformed401ResponsesDoNotRevokeOrDeleteCredentials(
         string untrusted401Body)
     {
         using var store = new InMemoryCredentialStore();
@@ -1370,7 +1370,7 @@ public sealed class HeartbeatSupervisorTests
     [InlineData(SessionState.Paused)]
     [InlineData(SessionState.LockedOrUnavailable)]
     [InlineData(SessionState.AwaitingOwnerApproval)]
-    public async Task Argon_3_4_005_RevocationUnconditionallyResetsInputsAcrossAllSessionStates(
+    public async Task Argon34005RevocationUnconditionallyResetsInputsAcrossAllSessionStates(
         SessionState targetSessionState)
     {
         using var store = new InMemoryCredentialStore();
@@ -1401,7 +1401,7 @@ public sealed class HeartbeatSupervisorTests
     }
 
     [Fact]
-    public async Task Argon_3_4_005_CleanupFailureDuringRevocationNeverRestoresAuthorization()
+    public async Task Argon34005CleanupFailureDuringRevocationNeverRestoresAuthorization()
     {
         using var store = new InMemoryCredentialStore { FailDelete = true };
         await SaveSeedCredentialAsync(store, DeviceIdA, TokenA);
@@ -1426,7 +1426,7 @@ public sealed class HeartbeatSupervisorTests
             inputExecutor: throwingInputExecutor);
 
         DeviceRevokedEventArgs? revokedEvent = null;
-        supervisor.RevocationConfirmed += (_, e) => revokedEvent = e;
+        supervisor.RevocationConfirmed += (sender, e) => revokedEvent = e;
 
         var res = await supervisor.TriggerHeartbeatNowAsync();
         Assert.Equal(HeartbeatOutcomeKind.Revoked, res.Outcome);
@@ -1442,14 +1442,14 @@ public sealed class HeartbeatSupervisorTests
 
     // Scenarios 14, 15 & 16 (ARGON-3.4-006):
     [Fact]
-    public async Task Argon_3_4_006_DisposeAndDisposeAsyncDuringManualAndBackgroundHeartbeatsAreRaceFree()
+    public async Task Argon34006DisposeAndDisposeAsyncDuringManualAndBackgroundHeartbeatsAreRaceFree()
     {
         using var store = new InMemoryCredentialStore();
         await SaveSeedCredentialAsync(store, DeviceIdA, TokenA);
 
         // Scenario 14: Synchronous Dispose() while manual TriggerHeartbeatNowAsync is in flight.
         var manualEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        using (var handler1 = new AsyncStubHttpMessageHandler(async (_, ct) =>
+        using (var handler1 = new AsyncStubHttpMessageHandler(async (unusedReq, ct) =>
         {
             _ = manualEntered.TrySetResult();
             await Task.Delay(Timeout.InfiniteTimeSpan, ct).ConfigureAwait(false);
@@ -1469,7 +1469,7 @@ public sealed class HeartbeatSupervisorTests
 
         // Scenario 15 & 16: Concurrent Dispose() and DisposeAsync() while background heartbeat loop is in flight.
         var bgEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        using (var handler2 = new AsyncStubHttpMessageHandler(async (_, ct) =>
+        using (var handler2 = new AsyncStubHttpMessageHandler(async (unusedReq, ct) =>
         {
             _ = bgEntered.TrySetResult();
             await Task.Delay(Timeout.InfiniteTimeSpan, ct).ConfigureAwait(false);
@@ -1491,7 +1491,7 @@ public sealed class HeartbeatSupervisorTests
 
     // Scenarios 17 & 18 (ARGON-3.4-007):
     [Fact]
-    public async Task Argon_3_4_007_StartAsyncAwaitsCancellingLoopAndStartsSingleReplacementLoop()
+    public async Task Argon34007StartAsyncAwaitsCancellingLoopAndStartsSingleReplacementLoop()
     {
         using var store = new InMemoryCredentialStore();
         await SaveSeedCredentialAsync(store, DeviceIdA, TokenA);
@@ -1504,7 +1504,7 @@ public sealed class HeartbeatSupervisorTests
         var activeRequests = 0;
         var maxConcurrentRequests = 0;
 
-        var stubClient = new DelegateHeartbeatClient(async (cred, _) =>
+        var stubClient = new DelegateHeartbeatClient(async (cred, unusedCt) =>
         {
             var currentActive = Interlocked.Increment(ref activeRequests);
             var prevMax = Volatile.Read(ref maxConcurrentRequests);
@@ -1568,7 +1568,7 @@ public sealed class HeartbeatSupervisorTests
     // 1. Production factory always injects durable DPAPI tombstone storage.
     // 2. Missing tombstone configuration cannot silently use in-memory storage.
     [Fact]
-    public async Task Argon_New_001_WindowsFactoryInjectsDurableDpapiTombstoneStoreAndCoreRejectsNullTombstoneStore()
+    public async Task ArgonNew001WindowsFactoryInjectsDurableDpapiTombstoneStoreAndCoreRejectsNullTombstoneStore()
     {
         using var store = new InMemoryCredentialStore();
         using var handler = new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.Unauthorized)
@@ -1614,7 +1614,7 @@ public sealed class HeartbeatSupervisorTests
     // NEW-002A (Test 3):
     // 3. Corrupted revocation history never gets overwritten as clean history.
     [Fact]
-    public async Task Argon_New_002A_CorruptedRevocationHistoryLatchesDurableFailClosedLockoutEvenAfterSubsequentRevocation()
+    public async Task ArgonNew002ACorruptedRevocationHistoryLatchesDurableFailClosedLockoutEvenAfterSubsequentRevocation()
     {
         var tempDir = Path.Combine(Path.GetTempPath(), $"BeaconStep34_CorruptHistory_{Guid.NewGuid():N}");
         Directory.CreateDirectory(tempDir);
@@ -1664,7 +1664,7 @@ public sealed class HeartbeatSupervisorTests
     // 4. Double persistence/deletion failure never restores operational authorization.
     // 5. Process restart after double failure remains fail-closed.
     [Fact]
-    public async Task Argon_New_002B_DoublePersistenceAndDeletionFailureRemainsFailClosedBeforeAndAfterProcessRestart()
+    public async Task ArgonNew002BDoublePersistenceAndDeletionFailureRemainsFailClosedBeforeAndAfterProcessRestart()
     {
         var tempDir = Path.Combine(Path.GetTempPath(), $"BeaconStep34_DoubleFail_{Guid.NewGuid():N}");
         Directory.CreateDirectory(tempDir);
@@ -1743,7 +1743,7 @@ public sealed class HeartbeatSupervisorTests
     // 6. Conditional credential deletion protects a concurrently saved new credential.
     // 7. Concurrent pairing and revocation are correctly serialized.
     [Fact]
-    public async Task Argon_New_003_ConditionalCredentialDeletionAndConcurrentPairingRevocationProtectNewlySavedCredential()
+    public async Task ArgonNew003ConditionalCredentialDeletionAndConcurrentPairingRevocationProtectNewlySavedCredential()
     {
         var tempDir = Path.Combine(Path.GetTempPath(), $"BeaconStep34_Toctou_{Guid.NewGuid():N}");
         Directory.CreateDirectory(tempDir);
@@ -1780,7 +1780,7 @@ public sealed class HeartbeatSupervisorTests
                     await allowDeleteToProceed.Task.ConfigureAwait(false);
                 });
 
-            using var handler = new StubHttpMessageHandler((req, _) =>
+            using var handler = new StubHttpMessageHandler((req, unusedBody) =>
             {
                 var token = req.Headers.Authorization?.Parameter;
                 return token == TokenB
@@ -1835,7 +1835,7 @@ public sealed class HeartbeatSupervisorTests
     // 8. Concurrent disposal and pairing are safe.
     // 9. Concurrent disposal and revocation are safe.
     [Fact]
-    public async Task Argon_New_004_ConcurrentDisposalDuringPairingAndRevocationDrainsSafelyWithoutObjectDisposedException()
+    public async Task ArgonNew004ConcurrentDisposalDuringPairingAndRevocationDrainsSafelyWithoutObjectDisposedException()
     {
         // Test 8: Concurrent DisposeAsync while AcknowledgeFreshPairingAsync is mid-execution.
         var loadEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -1916,7 +1916,7 @@ public sealed class HeartbeatSupervisorTests
     [InlineData(SessionState.Paused)]
     [InlineData(SessionState.LockedOrUnavailable)]
     [InlineData(SessionState.AwaitingOwnerApproval)]
-    public async Task Argon_New_005_RepairingDuringAnyActiveSessionTerminatesOldSessionResetsInputsAndEnforcesPendingVerification(
+    public async Task ArgonNew005RepairingDuringAnyActiveSessionTerminatesOldSessionResetsInputsAndEnforcesPendingVerification(
         SessionState oldSessionState)
     {
         using var store = new InMemoryCredentialStore();
@@ -1963,7 +1963,7 @@ public sealed class HeartbeatSupervisorTests
     // Requirement 6 (Test 13):
     // 13. Untrusted HTTP error strings are bounded and sanitized.
     [Fact]
-    public async Task Argon_HttpDiagnosticHardening_UntrustedProxyErrorStringsAreBoundedAndSanitizedWithoutDeletingCredentials()
+    public async Task ArgonHttpDiagnosticHardeningUntrustedProxyErrorStringsAreBoundedAndSanitizedWithoutDeletingCredentials()
     {
         using var store = new InMemoryCredentialStore();
         await SaveSeedCredentialAsync(store, DeviceIdA, TokenA);
@@ -2029,11 +2029,11 @@ public sealed class HeartbeatSupervisorTests
 
             if (targetSessionState == SessionState.Paused)
             {
-                sessionMachine.Pause();
+                _ = sessionMachine.Pause();
             }
             else if (targetSessionState == SessionState.LockedOrUnavailable)
             {
-                _ = sessionMachine.MarkDesktopLockedOrUnavailable();
+                _ = sessionMachine.NotifyDesktopLockedOrUnavailable();
             }
         }
 
