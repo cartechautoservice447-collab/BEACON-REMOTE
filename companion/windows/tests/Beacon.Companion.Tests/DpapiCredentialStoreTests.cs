@@ -151,16 +151,27 @@ public sealed class DpapiCredentialStoreTests : IDisposable
         }
 
         var validEnvelope = await File.ReadAllBytesAsync(credPath);
+        var ciphertextEnd = validEnvelope.Length - 32;
+        Assert.True(ciphertextEnd - 30 >= 128);
 
-        // Flip 1 bit in ciphertext
+        // 1. Flip 1 bit in envelope without updating checksum -> outer SHA-256 corruption check rejects before DPAPI.
         var bitFlipped = (byte[])validEnvelope.Clone();
         bitFlipped[35] ^= 0x01;
         await File.WriteAllBytesAsync(credPath, bitFlipped);
         await Assert.ThrowsAsync<CredentialStoreCorruptedException>(() => store.LoadAsync());
 
-        // Flip 1 bit in ciphertext AND recompute outer SHA-256 -> DPAPI integrity check must still reject!
-        _ = SHA256.HashData(bitFlipped.AsSpan(0, bitFlipped.Length - 32), bitFlipped.AsSpan(bitFlipped.Length - 32, 32));
-        await File.WriteAllBytesAsync(credPath, bitFlipped);
+        // 2. Flip 1 bit in the DPAPI pbSign HMAC tail AND recompute outer SHA-256 -> DPAPI integrity check must reject!
+        var hmacTampered = (byte[])validEnvelope.Clone();
+        hmacTampered[ciphertextEnd - 10] ^= 0x01;
+        _ = SHA256.HashData(hmacTampered.AsSpan(0, ciphertextEnd), hmacTampered.AsSpan(ciphertextEnd, 32));
+        await File.WriteAllBytesAsync(credPath, hmacTampered);
+        await Assert.ThrowsAsync<CredentialStoreCorruptedException>(() => store.LoadAsync());
+
+        // 3. Flip 1 bit in the DPAPI pbData encrypted payload AND recompute outer SHA-256 -> DPAPI integrity check must reject!
+        var payloadTampered = (byte[])validEnvelope.Clone();
+        payloadTampered[ciphertextEnd - 80] ^= 0x01;
+        _ = SHA256.HashData(payloadTampered.AsSpan(0, ciphertextEnd), payloadTampered.AsSpan(ciphertextEnd, 32));
+        await File.WriteAllBytesAsync(credPath, payloadTampered);
         await Assert.ThrowsAsync<CredentialStoreCorruptedException>(() => store.LoadAsync());
 
         // Wrong magic bytes
