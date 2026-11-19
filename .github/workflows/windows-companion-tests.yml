@@ -80,6 +80,7 @@ jobs:
           --logger "console;verbosity=detailed"
           --logger "trx;LogFileName=beacon-companion-tests.trx"
           --results-directory TestResults
+          -bl:TestResults/msbuild-test.binlog
 
       - name: Print TRX & Test Host Failure Summary
         if: ${{ always() }}
@@ -124,12 +125,12 @@ jobs:
           }
 
       - name: Upload TRX & VSTest diagnostic artifacts
-        if: ${{ always() && (steps.test.outcome == 'success' || steps.test.outcome == 'failure') }}
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: beacon-companion-windows-trx
           path: TestResults/**/*
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 30
 
   test-typescript-contract:
