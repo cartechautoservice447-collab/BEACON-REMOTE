@@ -31,14 +31,16 @@ public interface IHeartbeatSupervisor : IAsyncDisposable, IDisposable
 }
 
 /// <summary>
-/// Coordinates periodic device heartbeats, bounded exponential backoff with jitter,
-/// single-loop execution safety, stale-response epoch fencing, active session termination,
-/// and fail-closed revocation handling requiring fresh authorized pairing before recovery.
+/// Coordinates periodic device heartbeats, server-verified operational authorization (<see cref="DeviceAuthorizationStatus.PendingVerification"/> -> <see cref="DeviceAuthorizationStatus.Authorized"/>),
+/// bounded exponential backoff with jitter, single-loop execution safety, stale-response epoch fencing,
+/// active session termination, unconditional input release, durable revocation tombstone persistence,
+/// atomic conditional credential deletion, and race-free shutdown/disposal.
 /// </summary>
 public sealed class HeartbeatSupervisor : IHeartbeatSupervisor
 {
     private readonly ICredentialStore _credentialStore;
     private readonly IHeartbeatClient _heartbeatClient;
+    private readonly IRevocationTombstoneStore _tombstoneStore;
     private readonly HeartbeatSupervisorOptions _options;
     private readonly SessionStateMachine? _sessionStateMachine;
     private readonly IInputExecutor? _inputExecutor;
@@ -47,6 +49,8 @@ public sealed class HeartbeatSupervisor : IHeartbeatSupervisor
 
     private readonly Lock _stateLock = new();
     private readonly SemaphoreSlim _heartbeatExecutionLock = new(1, 1);
+    private readonly CancellationTokenSource _lifetimeCts = new();
+    private readonly TaskCompletionSource _operationsDrainedTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly HashSet<Guid> _revokedDeviceIds = [];
 
     private DeviceAuthorizationStatus _authorizationStatus = DeviceAuthorizationStatus.Unpaired;
@@ -65,15 +69,29 @@ public sealed class HeartbeatSupervisor : IHeartbeatSupervisor
     private DateTimeOffset? _revokedAtUtc;
     private HeartbeatOutcomeKind? _lastOutcome;
     private string? _lastErrorDetail;
+    private bool? _lastCredentialPurgeSucceeded;
+    private bool? _lastTombstonePersisted;
+    private bool? _lastInputResetSucceeded;
+    private string? _lastCleanupErrorDetail;
     private DeviceRevokedEventArgs? _lastRevocationDetails;
 
     private CancellationTokenSource? _runningCts;
     private Task? _loopTask;
+    private int _activeExecutionReservations;
+    private int _executionResourcesReleased;
     private int _disposed;
 
+    /// <summary>
+    /// Initializes a new instance of <see cref="HeartbeatSupervisor"/> with an explicitly required
+    /// <see cref="IRevocationTombstoneStore"/> so production hosts can never silently fall back
+    /// to an in-memory tombstone store (ARGON NEW-001).
+    /// Windows hosts should use <c>WindowsHeartbeatSupervisorFactory.Create</c> to wire
+    /// <c>DpapiRevocationTombstoneStore</c>.
+    /// </summary>
     public HeartbeatSupervisor(
         ICredentialStore credentialStore,
         IHeartbeatClient heartbeatClient,
+        IRevocationTombstoneStore tombstoneStore,
         HeartbeatSupervisorOptions? options = null,
         SessionStateMachine? sessionStateMachine = null,
         IInputExecutor? inputExecutor = null,
@@ -82,12 +100,14 @@ public sealed class HeartbeatSupervisor : IHeartbeatSupervisor
     {
         ArgumentNullException.ThrowIfNull(credentialStore);
         ArgumentNullException.ThrowIfNull(heartbeatClient);
+        ArgumentNullException.ThrowIfNull(tombstoneStore);
 
         _options = options ?? new HeartbeatSupervisorOptions();
         _options.Validate();
 
         _credentialStore = credentialStore;
         _heartbeatClient = heartbeatClient;
+        _tombstoneStore = tombstoneStore;
         _sessionStateMachine = sessionStateMachine;
         _inputExecutor = inputExecutor;
         _timeProvider = timeProvider ?? TimeProvider.System;
@@ -109,43 +129,100 @@ public sealed class HeartbeatSupervisor : IHeartbeatSupervisor
         }
     }
 
-    public Task StartAsync(CancellationToken ct = default)
+    public async Task StartAsync(CancellationToken ct = default)
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
         ct.ThrowIfCancellationRequested();
 
-        HeartbeatSnapshot snapshot;
-        lock (_stateLock)
+        if (!TryEnterExecutionReservation())
         {
-            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
-
-            if (_authorizationStatus == DeviceAuthorizationStatus.Revoked)
-            {
-                throw new DeviceRevokedException(
-                    "Cannot start heartbeat supervisor because the device has been revoked. Pair the device again before restarting.",
-                    _lastRevocationDetails ?? new DeviceRevokedEventArgs(
-                        _boundDeviceId,
-                        _revokedAtUtc ?? _timeProvider.GetUtcNow(),
-                        "unauthorized",
-                        "Device has been revoked."));
-            }
-
-            if (_loopTask is { IsCompleted: false })
-            {
-                return Task.CompletedTask;
-            }
-
-            _runningCts?.Dispose();
-            _runningCts = new CancellationTokenSource();
-            _connectivityState = HeartbeatConnectivityState.Starting;
-
-            var loopToken = _runningCts.Token;
-            _loopTask = Task.Run(() => RunLoopAsync(loopToken), CancellationToken.None);
-            snapshot = BuildSnapshotUnsafe();
+            throw new ObjectDisposedException(nameof(HeartbeatSupervisor));
         }
 
-        SnapshotChanged?.Invoke(this, snapshot);
-        return Task.CompletedTask;
+        try
+        {
+            while (true)
+            {
+                Task? cancellingLoopToWait = null;
+                CancellationTokenSource? cancellingCts = null;
+                HeartbeatSnapshot? snapshot = null;
+
+                lock (_stateLock)
+                {
+                    ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+
+                    if (_authorizationStatus == DeviceAuthorizationStatus.Revoked)
+                    {
+                        throw new DeviceRevokedException(
+                            "Cannot start heartbeat supervisor because the device has been revoked. Pair the device again before restarting.",
+                            _lastRevocationDetails ?? new DeviceRevokedEventArgs(
+                                _boundDeviceId,
+                                _revokedAtUtc ?? _timeProvider.GetUtcNow(),
+                                "unauthorized",
+                                "Device has been revoked."));
+                    }
+
+                    // ARGON-3.4-007: Distinguish an active healthy loop from a loop whose CancellationTokenSource
+                    // has already been cancelled and is in the middle of exiting.
+                    if (_loopTask is { IsCompleted: false })
+                    {
+                        if (_runningCts is { IsCancellationRequested: false })
+                        {
+                            return;
+                        }
+
+                        cancellingLoopToWait = _loopTask;
+                        cancellingCts = _runningCts;
+                    }
+                    else
+                    {
+                        _runningCts?.Dispose();
+                        _runningCts = CancellationTokenSource.CreateLinkedTokenSource(_lifetimeCts.Token);
+                        _connectivityState = HeartbeatConnectivityState.Starting;
+
+                        var loopToken = _runningCts.Token;
+                        _loopTask = Task.Run(() => RunLoopAsync(loopToken), CancellationToken.None);
+                        snapshot = BuildSnapshotUnsafe();
+                    }
+                }
+
+                if (cancellingLoopToWait is not null)
+                {
+                    try
+                    {
+                        await cancellingLoopToWait.WaitAsync(ct).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                    {
+                        // Previous cancelled loop completed shutdown.
+                    }
+
+                    lock (_stateLock)
+                    {
+                        if (ReferenceEquals(_runningCts, cancellingCts) &&
+                            (_loopTask is null || _loopTask.IsCompleted))
+                        {
+                            _runningCts?.Dispose();
+                            _runningCts = null;
+                            _loopTask = null;
+                        }
+                    }
+
+                    continue;
+                }
+
+                if (snapshot is not null)
+                {
+                    SnapshotChanged?.Invoke(this, snapshot);
+                }
+
+                return;
+            }
+        }
+        finally
+        {
+            ExitExecutionReservation();
+        }
     }
 
     public async Task StopAsync(CancellationToken ct = default)
@@ -166,7 +243,14 @@ public sealed class HeartbeatSupervisor : IHeartbeatSupervisor
 
         if (ctsToCancel is not null)
         {
-            await ctsToCancel.CancelAsync().ConfigureAwait(false);
+            try
+            {
+                await ctsToCancel.CancelAsync().ConfigureAwait(false);
+            }
+            catch (ObjectDisposedException)
+            {
+                // Already disposed concurrently.
+            }
         }
 
         if (loopToWait is not null)
@@ -226,15 +310,53 @@ public sealed class HeartbeatSupervisor : IHeartbeatSupervisor
             }
         }
 
-        await _heartbeatExecutionLock.WaitAsync(ct).ConfigureAwait(false);
+        // ARGON-3.4-006 & NEW-004: Reserve active execution slot and link to supervisor _lifetimeCts
+        // so concurrent Dispose/DisposeAsync cancels in-flight work and never disposes
+        // _heartbeatExecutionLock or _lifetimeCts while a thread is waiting on or releasing them.
+        if (!TryEnterExecutionReservation())
+        {
+            throw new ObjectDisposedException(nameof(HeartbeatSupervisor));
+        }
+
         try
         {
-            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
-            return await ExecuteSingleHeartbeatAsync(ct).ConfigureAwait(false);
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, _lifetimeCts.Token);
+            var effectiveToken = linkedCts.Token;
+
+            var lockAcquired = false;
+            try
+            {
+                await _heartbeatExecutionLock.WaitAsync(effectiveToken).ConfigureAwait(false);
+                lockAcquired = true;
+
+                if (Volatile.Read(ref _disposed) != 0)
+                {
+                    return HeartbeatAttemptResult.Failure(
+                        HeartbeatOutcomeKind.Cancelled,
+                        "Heartbeat supervisor was disposed while heartbeat was starting.",
+                        deviceId: _boundDeviceId);
+                }
+
+                return await ExecuteSingleHeartbeatAsync(effectiveToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (Volatile.Read(ref _disposed) != 0 && !ct.IsCancellationRequested)
+            {
+                return HeartbeatAttemptResult.Failure(
+                    HeartbeatOutcomeKind.Cancelled,
+                    "Heartbeat was cancelled because the supervisor is shutting down.",
+                    deviceId: _boundDeviceId);
+            }
+            finally
+            {
+                if (lockAcquired)
+                {
+                    _ = _heartbeatExecutionLock.Release();
+                }
+            }
         }
         finally
         {
-            _ = _heartbeatExecutionLock.Release();
+            ExitExecutionReservation();
         }
     }
 
@@ -245,113 +367,165 @@ public sealed class HeartbeatSupervisor : IHeartbeatSupervisor
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
         ct.ThrowIfCancellationRequested();
 
-        DeviceCredential? loadedCredential;
+        // ARGON NEW-004: Enroll AcknowledgeFreshPairingAsync in supervisor lifetime reservation.
+        if (!TryEnterExecutionReservation())
+        {
+            throw new ObjectDisposedException(nameof(HeartbeatSupervisor));
+        }
+
         try
         {
-            loadedCredential = await _credentialStore.LoadAsync(ct).ConfigureAwait(false);
-        }
-        catch (CredentialStoreCorruptedException ex)
-        {
-            throw new DeviceNotAuthorizedException(
-                "Stored credential could not be decrypted after fresh pairing acknowledgment.",
-                ex);
-        }
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, _lifetimeCts.Token);
+            var effectiveToken = linkedCts.Token;
 
-        if (loadedCredential is null)
-        {
-            throw new DeviceNotAuthorizedException(
-                "Cannot acknowledge fresh pairing because no credential is stored.",
-                DeviceAuthorizationStatus.Unpaired);
-        }
-
-        HeartbeatSnapshot snapshot;
-        using (loadedCredential)
-        {
-            if (loadedCredential.IsDisposed || !DeviceCredential.IsValidTokenFormat(loadedCredential.Token))
+            DeviceCredential? loadedCredential;
+            try
+            {
+                loadedCredential = await _credentialStore.LoadAsync(effectiveToken).ConfigureAwait(false);
+            }
+            catch (CredentialStoreCorruptedException ex)
             {
                 throw new DeviceNotAuthorizedException(
-                    "Stored device credential is invalid.",
-                    DeviceAuthorizationStatus.CredentialInvalid);
+                    "Stored credential could not be decrypted after fresh pairing acknowledgment.",
+                    ex);
             }
 
-            var newDeviceId = loadedCredential.Metadata.DeviceId;
-            var originValidation = ServerOriginValidator.Validate(
-                loadedCredential.Metadata.ServerOrigin,
-                _options.AllowDevelopmentLoopbackHttp);
-            if (!originValidation.IsValid || originValidation.CanonicalOrigin is null)
+            if (loadedCredential is null)
             {
                 throw new DeviceNotAuthorizedException(
-                    originValidation.ErrorDetail ?? "Stored ServerOrigin is invalid.",
-                    DeviceAuthorizationStatus.CredentialInvalid);
+                    "Cannot acknowledge fresh pairing because no credential is stored.",
+                    DeviceAuthorizationStatus.Unpaired);
             }
 
-            CancellationTokenSource? ctsToCancel;
-            Task? priorLoopTask;
-            lock (_stateLock)
+            HeartbeatSnapshot snapshot;
+            using (loadedCredential)
             {
-                ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
-
-                if (_revokedDeviceIds.Contains(newDeviceId))
+                if (loadedCredential.IsDisposed || !DeviceCredential.IsValidTokenFormat(loadedCredential.Token))
                 {
-                    throw new DeviceRevokedException(
-                        "Cannot restore authorization using a previously revoked DeviceId. Complete a fresh pairing.",
-                        _lastRevocationDetails ?? new DeviceRevokedEventArgs(
-                            newDeviceId,
-                            _timeProvider.GetUtcNow(),
-                            "unauthorized",
-                            "Previously revoked device identity rejected."));
+                    throw new DeviceNotAuthorizedException(
+                        "Stored device credential is invalid.",
+                        DeviceAuthorizationStatus.CredentialInvalid);
                 }
 
-                // Fence any older in-flight heartbeats from the previous epoch so stale 200 or 401
-                // responses can never clobber the newly paired device.
-                _epoch++;
-                _authorizationStatus = DeviceAuthorizationStatus.Authorized;
-                _connectivityState = HeartbeatConnectivityState.Idle;
-                _boundDeviceId = newDeviceId;
-                _boundServerOrigin = originValidation.CanonicalOrigin;
-                _consecutiveTransientFailures = 0;
-                _revokedAtUtc = null;
-                _lastErrorDetail = null;
-                _lastOutcome = null;
-                _lastRevocationDetails = null;
-                ctsToCancel = _runningCts;
-                priorLoopTask = _loopTask;
-                snapshot = BuildSnapshotUnsafe();
-            }
+                var newDeviceId = loadedCredential.Metadata.DeviceId;
+                var originValidation = ServerOriginValidator.Validate(
+                    loadedCredential.Metadata.ServerOrigin,
+                    _options.AllowDevelopmentLoopbackHttp);
+                if (!originValidation.IsValid || originValidation.CanonicalOrigin is null)
+                {
+                    throw new DeviceNotAuthorizedException(
+                        originValidation.ErrorDetail ?? "Stored ServerOrigin is invalid.",
+                        DeviceAuthorizationStatus.CredentialInvalid);
+                }
 
-            if (ctsToCancel is not null)
-            {
-                await ctsToCancel.CancelAsync().ConfigureAwait(false);
-            }
-
-            if (startSupervisorLoop && priorLoopTask is not null)
-            {
+                // ARGON-3.4-002: Consult durable revocation tombstone store before accepting any DeviceId.
+                // Fail closed if the tombstone ledger is corrupted or unreadable.
+                bool durablyRevoked;
                 try
                 {
-                    await priorLoopTask.WaitAsync(ct).ConfigureAwait(false);
+                    durablyRevoked = await _tombstoneStore.IsRevokedAsync(newDeviceId, effectiveToken).ConfigureAwait(false);
                 }
-                catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                catch (Exception ex) when (ex is not OperationCanceledException)
                 {
-                    // Previous loop shut down cleanly on cancellation.
+                    throw new DeviceNotAuthorizedException(
+                        "Unable to verify device revocation tombstone ledger; failing closed.",
+                        ex);
                 }
 
+                CancellationTokenSource? ctsToCancel;
+                Task? priorLoopTask;
                 lock (_stateLock)
                 {
-                    if (ReferenceEquals(_runningCts, ctsToCancel))
+                    ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+
+                    if (durablyRevoked || _revokedDeviceIds.Contains(newDeviceId))
                     {
-                        _runningCts?.Dispose();
-                        _runningCts = null;
-                        _loopTask = null;
+                        _ = _revokedDeviceIds.Add(newDeviceId);
+                        throw new DeviceRevokedException(
+                            "Cannot restore authorization using a previously revoked DeviceId. Complete a fresh pairing.",
+                            _lastRevocationDetails ?? new DeviceRevokedEventArgs(
+                                newDeviceId,
+                                _timeProvider.GetUtcNow(),
+                                "unauthorized",
+                                "Previously revoked device identity rejected."));
+                    }
+
+                    // ARGON-3.4-001 & NEW-005: Immediately fence the previous epoch and move to
+                    // PendingVerification (NOT Authorized) before terminating any previous active session.
+                    _epoch++;
+                    _authorizationStatus = DeviceAuthorizationStatus.PendingVerification;
+                    _connectivityState = HeartbeatConnectivityState.Idle;
+                    _boundDeviceId = newDeviceId;
+                    _boundServerOrigin = originValidation.CanonicalOrigin;
+                    _consecutiveTransientFailures = 0;
+                    _revokedAtUtc = null;
+                    _lastErrorDetail = null;
+                    _lastOutcome = null;
+                    _lastCredentialPurgeSucceeded = null;
+                    _lastTombstonePersisted = null;
+                    _lastInputResetSucceeded = null;
+                    _lastCleanupErrorDetail = null;
+                    _lastRevocationDetails = null;
+                    ctsToCancel = _runningCts;
+                    priorLoopTask = _loopTask;
+                }
+
+                if (ctsToCancel is not null)
+                {
+                    try
+                    {
+                        await ctsToCancel.CancelAsync().ConfigureAwait(false);
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                        // Already disposed.
                     }
                 }
+
+                if (priorLoopTask is not null)
+                {
+                    try
+                    {
+                        await priorLoopTask.WaitAsync(effectiveToken).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (!effectiveToken.IsCancellationRequested)
+                    {
+                        // Previous loop shut down cleanly on cancellation.
+                    }
+
+                    lock (_stateLock)
+                    {
+                        if (ReferenceEquals(_runningCts, ctsToCancel))
+                        {
+                            _runningCts?.Dispose();
+                            _runningCts = null;
+                            _loopTask = null;
+                        }
+                    }
+                }
+
+                // ARGON NEW-005: Always terminate any active or pending session from the previous device
+                // and unconditionally reset held inputs before publishing the new device's PendingVerification state.
+                // Cleanup exceptions are recorded without restoring previous authorization.
+                var (inputResetSucceeded, cleanupError) = await TerminateActiveSessionAndResetInputsAsync(effectiveToken).ConfigureAwait(false);
+                lock (_stateLock)
+                {
+                    _lastInputResetSucceeded = inputResetSucceeded;
+                    _lastCleanupErrorDetail = cleanupError;
+                    snapshot = BuildSnapshotUnsafe();
+                }
+            }
+
+            SnapshotChanged?.Invoke(this, snapshot);
+
+            if (startSupervisorLoop)
+            {
+                await StartAsync(effectiveToken).ConfigureAwait(false);
             }
         }
-
-        SnapshotChanged?.Invoke(this, snapshot);
-
-        if (startSupervisorLoop)
+        finally
         {
-            await StartAsync(ct).ConfigureAwait(false);
+            ExitExecutionReservation();
         }
     }
 
@@ -362,71 +536,119 @@ public sealed class HeartbeatSupervisor : IHeartbeatSupervisor
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
-        var now = _timeProvider.GetUtcNow();
-        var effectiveReason = string.IsNullOrWhiteSpace(reason)
-            ? "Device authorization was revoked."
-            : reason.Trim();
-
-        Guid? targetDeviceId = null;
-        DeviceRevokedEventArgs? revokedArgs = null;
-        HeartbeatSnapshot? snapshot = null;
-        CancellationTokenSource? ctsToCancel = null;
-        bool shouldPerformSideEffects = false;
-
-        lock (_stateLock)
+        // ARGON NEW-004: Enroll NotifyAuthorizationRevokedAsync in supervisor lifetime reservation.
+        if (!TryEnterExecutionReservation())
         {
-            if (expectedDeviceId.HasValue)
+            throw new ObjectDisposedException(nameof(HeartbeatSupervisor));
+        }
+
+        try
+        {
+            var now = _timeProvider.GetUtcNow();
+            var effectiveReason = string.IsNullOrWhiteSpace(reason)
+                ? "Device authorization was revoked."
+                : reason.Trim();
+
+            Guid? targetDeviceId = null;
+            CancellationTokenSource? ctsToCancel = null;
+            bool shouldPerformSideEffects = false;
+            Guid? staleRevokedIdToPersistOnly = null;
+
+            lock (_stateLock)
             {
-                if (_boundDeviceId.HasValue && _boundDeviceId.Value != expectedDeviceId.Value)
+                if (expectedDeviceId.HasValue)
                 {
                     _ = _revokedDeviceIds.Add(expectedDeviceId.Value);
-                    return;
+                    if (_boundDeviceId.HasValue && _boundDeviceId.Value != expectedDeviceId.Value)
+                    {
+                        staleRevokedIdToPersistOnly = expectedDeviceId.Value;
+                    }
+                    else
+                    {
+                        targetDeviceId = expectedDeviceId.Value;
+                    }
+                }
+                else if (_boundDeviceId.HasValue)
+                {
+                    targetDeviceId = _boundDeviceId.Value;
+                    _ = _revokedDeviceIds.Add(_boundDeviceId.Value);
                 }
 
-                targetDeviceId = expectedDeviceId.Value;
-                _ = _revokedDeviceIds.Add(expectedDeviceId.Value);
-            }
-            else if (_boundDeviceId.HasValue)
-            {
-                targetDeviceId = _boundDeviceId.Value;
-                _ = _revokedDeviceIds.Add(_boundDeviceId.Value);
+                if (staleRevokedIdToPersistOnly.HasValue)
+                {
+                    shouldPerformSideEffects = false;
+                }
+                else if (_authorizationStatus == DeviceAuthorizationStatus.Revoked)
+                {
+                    return;
+                }
+                else
+                {
+                    _epoch++;
+                    _authorizationStatus = DeviceAuthorizationStatus.Revoked;
+                    _connectivityState = HeartbeatConnectivityState.Revoked;
+                    _revokedAtUtc = now;
+                    _lastOutcome = HeartbeatOutcomeKind.Revoked;
+                    _lastErrorDetail = effectiveReason;
+                    _lastRevocationDetails = new DeviceRevokedEventArgs(targetDeviceId, now, "revoked", effectiveReason);
+                    ctsToCancel = _runningCts;
+                    shouldPerformSideEffects = true;
+                }
             }
 
-            if (_authorizationStatus == DeviceAuthorizationStatus.Revoked)
+            if (staleRevokedIdToPersistOnly.HasValue)
             {
+                _ = await TryPersistTombstoneWithRetryAsync(staleRevokedIdToPersistOnly.Value, now).ConfigureAwait(false);
                 return;
             }
 
-            _epoch++;
-            _authorizationStatus = DeviceAuthorizationStatus.Revoked;
-            _connectivityState = HeartbeatConnectivityState.Revoked;
-            _revokedAtUtc = now;
-            _lastOutcome = HeartbeatOutcomeKind.Revoked;
-            _lastErrorDetail = effectiveReason;
-            revokedArgs = new DeviceRevokedEventArgs(targetDeviceId, now, "revoked", effectiveReason);
-            _lastRevocationDetails = revokedArgs;
-            ctsToCancel = _runningCts;
-            snapshot = BuildSnapshotUnsafe();
-            shouldPerformSideEffects = true;
-        }
-
-        if (ctsToCancel is not null)
-        {
-            await ctsToCancel.CancelAsync().ConfigureAwait(false);
-        }
-
-        if (shouldPerformSideEffects)
-        {
-            await ExecuteRevocationSideEffectsAsync(targetDeviceId, ct).ConfigureAwait(false);
-            if (revokedArgs is not null)
+            if (ctsToCancel is not null)
             {
-                RevocationConfirmed?.Invoke(this, revokedArgs);
+                try
+                {
+                    await ctsToCancel.CancelAsync().ConfigureAwait(false);
+                }
+                catch (ObjectDisposedException)
+                {
+                    // Ignore if already disposed.
+                }
             }
 
-            if (snapshot is not null)
+            if (shouldPerformSideEffects)
             {
-                SnapshotChanged?.Invoke(this, snapshot);
+                var cleanup = await ExecuteRevocationSideEffectsAsync(targetDeviceId, now, ct).ConfigureAwait(false);
+                DeviceRevokedEventArgs revokedArgs;
+                HeartbeatSnapshot snapshot;
+
+                lock (_stateLock)
+                {
+                    _lastCredentialPurgeSucceeded = cleanup.CredentialPurgeSucceeded;
+                    _lastTombstonePersisted = cleanup.TombstonePersisted;
+                    _lastInputResetSucceeded = cleanup.InputResetSucceeded;
+                    _lastCleanupErrorDetail = cleanup.CleanupErrorDetail;
+                    revokedArgs = new DeviceRevokedEventArgs(
+                        targetDeviceId,
+                        now,
+                        "revoked",
+                        effectiveReason,
+                        cleanup.CredentialPurgeSucceeded,
+                        cleanup.TombstonePersisted,
+                        cleanup.InputResetSucceeded,
+                        cleanup.CleanupErrorDetail);
+                    _lastRevocationDetails = revokedArgs;
+                    snapshot = BuildSnapshotUnsafe();
+                }
+
+                if (Volatile.Read(ref _disposed) == 0)
+                {
+                    RevocationConfirmed?.Invoke(this, revokedArgs);
+                    SnapshotChanged?.Invoke(this, snapshot);
+                }
             }
+        }
+        finally
+        {
+            ExitExecutionReservation();
         }
     }
 
@@ -447,10 +669,17 @@ public sealed class HeartbeatSupervisor : IHeartbeatSupervisor
                         "Device has been revoked."));
             }
 
+            if (_authorizationStatus == DeviceAuthorizationStatus.PendingVerification)
+            {
+                throw new DeviceNotAuthorizedException(
+                    "Operation rejected because the device credential is pending server heartbeat verification.",
+                    DeviceAuthorizationStatus.PendingVerification);
+            }
+
             if (_authorizationStatus != DeviceAuthorizationStatus.Authorized || _boundDeviceId is not { } deviceId)
             {
                 throw new DeviceNotAuthorizedException(
-                    "Operation rejected because no authorized device credential is active.",
+                    "Operation rejected because no server-verified authorized device credential is active.",
                     _authorizationStatus);
             }
 
@@ -528,6 +757,15 @@ public sealed class HeartbeatSupervisor : IHeartbeatSupervisor
 
         try
         {
+            _lifetimeCts.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+            // Ignore concurrent disposal.
+        }
+
+        try
+        {
             cts?.Cancel();
         }
         catch (ObjectDisposedException)
@@ -536,13 +774,22 @@ public sealed class HeartbeatSupervisor : IHeartbeatSupervisor
         }
 
         cts?.Dispose();
-        _heartbeatExecutionLock.Dispose();
+
+        // ARGON-3.4-006 & NEW-004: Only release _heartbeatExecutionLock and _lifetimeCts immediately
+        // if no execution reservation is active; otherwise the last active reservation releases them in
+        // ExitExecutionReservation(), preventing ObjectDisposedException during in-flight operations.
+        if (Volatile.Read(ref _activeExecutionReservations) == 0)
+        {
+            _ = _operationsDrainedTcs.TrySetResult();
+            ReleaseExecutionResourcesIfNeeded();
+        }
     }
 
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
         {
+            await _operationsDrainedTcs.Task.ConfigureAwait(false);
             return;
         }
 
@@ -554,6 +801,15 @@ public sealed class HeartbeatSupervisor : IHeartbeatSupervisor
             loopTask = _loopTask;
             _runningCts = null;
             _loopTask = null;
+        }
+
+        try
+        {
+            await _lifetimeCts.CancelAsync().ConfigureAwait(false);
+        }
+        catch (ObjectDisposedException)
+        {
+            // Already disposed.
         }
 
         if (cts is not null)
@@ -581,21 +837,80 @@ public sealed class HeartbeatSupervisor : IHeartbeatSupervisor
         }
 
         cts?.Dispose();
+
+        if (Volatile.Read(ref _activeExecutionReservations) == 0)
+        {
+            _ = _operationsDrainedTcs.TrySetResult();
+        }
+
+        await _operationsDrainedTcs.Task.ConfigureAwait(false);
+        ReleaseExecutionResourcesIfNeeded();
+    }
+
+    private bool TryEnterExecutionReservation()
+    {
+        while (true)
+        {
+            if (Volatile.Read(ref _disposed) != 0)
+            {
+                return false;
+            }
+
+            var current = Volatile.Read(ref _activeExecutionReservations);
+            if (Interlocked.CompareExchange(ref _activeExecutionReservations, current + 1, current) == current)
+            {
+                if (Volatile.Read(ref _disposed) != 0)
+                {
+                    ExitExecutionReservation();
+                    return false;
+                }
+
+                return true;
+            }
+        }
+    }
+
+    private void ExitExecutionReservation()
+    {
+        if (Interlocked.Decrement(ref _activeExecutionReservations) == 0 &&
+            Volatile.Read(ref _disposed) != 0)
+        {
+            _ = _operationsDrainedTcs.TrySetResult();
+            ReleaseExecutionResourcesIfNeeded();
+        }
+    }
+
+    private void ReleaseExecutionResourcesIfNeeded()
+    {
+        if (Interlocked.Exchange(ref _executionResourcesReleased, 1) != 0)
+        {
+            return;
+        }
+
         _heartbeatExecutionLock.Dispose();
+        _lifetimeCts.Dispose();
     }
 
     private async Task RunLoopAsync(CancellationToken loopToken)
     {
         while (!loopToken.IsCancellationRequested && Volatile.Read(ref _disposed) == 0)
         {
+            if (!TryEnterExecutionReservation())
+            {
+                break;
+            }
+
             HeartbeatAttemptResult result;
             int transientFailuresSnapshot;
 
             try
             {
-                await _heartbeatExecutionLock.WaitAsync(loopToken).ConfigureAwait(false);
+                var lockAcquired = false;
                 try
                 {
+                    await _heartbeatExecutionLock.WaitAsync(loopToken).ConfigureAwait(false);
+                    lockAcquired = true;
+
                     if (loopToken.IsCancellationRequested || Volatile.Read(ref _disposed) != 0)
                     {
                         break;
@@ -605,20 +920,30 @@ public sealed class HeartbeatSupervisor : IHeartbeatSupervisor
                 }
                 finally
                 {
-                    _ = _heartbeatExecutionLock.Release();
+                    if (lockAcquired)
+                    {
+                        _ = _heartbeatExecutionLock.Release();
+                    }
                 }
             }
-            catch (OperationCanceledException) when (loopToken.IsCancellationRequested)
+            catch (OperationCanceledException) when (loopToken.IsCancellationRequested || Volatile.Read(ref _disposed) != 0)
             {
                 break;
+            }
+            finally
+            {
+                ExitExecutionReservation();
             }
 
             bool shouldContinue;
             lock (_stateLock)
             {
                 transientFailuresSnapshot = _consecutiveTransientFailures;
-                shouldContinue = _authorizationStatus == DeviceAuthorizationStatus.Authorized &&
-                    !loopToken.IsCancellationRequested;
+                shouldContinue = _authorizationStatus is
+                    DeviceAuthorizationStatus.Authorized or
+                    DeviceAuthorizationStatus.PendingVerification &&
+                    !loopToken.IsCancellationRequested &&
+                    Volatile.Read(ref _disposed) == 0;
             }
 
             if (!shouldContinue)
@@ -633,7 +958,7 @@ public sealed class HeartbeatSupervisor : IHeartbeatSupervisor
                 {
                     await Task.Delay(delay, _timeProvider, loopToken).ConfigureAwait(false);
                 }
-                catch (OperationCanceledException) when (loopToken.IsCancellationRequested)
+                catch (OperationCanceledException) when (loopToken.IsCancellationRequested || Volatile.Read(ref _disposed) != 0)
                 {
                     break;
                 }
@@ -728,6 +1053,34 @@ public sealed class HeartbeatSupervisor : IHeartbeatSupervisor
                     "Loaded device credential was disposed unexpectedly.");
             }
 
+            // ARGON-3.4-002: Check durable revocation tombstone store before authorizing or transmitting.
+            // If the tombstone store throws (corrupted or tampered file), fail closed immediately.
+            bool durablyRevoked;
+            try
+            {
+                durablyRevoked = await _tombstoneStore.IsRevokedAsync(credentialDeviceId, ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                return HeartbeatAttemptResult.Failure(
+                    HeartbeatOutcomeKind.Cancelled,
+                    "Tombstone check cancelled before heartbeat.",
+                    deviceId: credentialDeviceId);
+            }
+            catch (Exception)
+            {
+                await HandleCredentialUnavailableAsync(
+                    capturedEpoch,
+                    DeviceAuthorizationStatus.CredentialInvalid,
+                    "Revocation tombstone store is corrupted or unreadable; failing closed.",
+                    ct).ConfigureAwait(false);
+
+                return HeartbeatAttemptResult.Failure(
+                    HeartbeatOutcomeKind.InvalidCredential,
+                    "Revocation tombstone store is corrupted or unreadable; failing closed.",
+                    deviceId: credentialDeviceId);
+            }
+
             long sequence;
             bool blockedByRevokedId = false;
             bool staleBeforeSend = false;
@@ -740,8 +1093,9 @@ public sealed class HeartbeatSupervisor : IHeartbeatSupervisor
                     staleBeforeSend = true;
                     sequence = 0;
                 }
-                else if (_revokedDeviceIds.Contains(credentialDeviceId))
+                else if (durablyRevoked || _revokedDeviceIds.Contains(credentialDeviceId))
                 {
+                    _ = _revokedDeviceIds.Add(credentialDeviceId);
                     blockedByRevokedId = true;
                     sequence = 0;
                 }
@@ -752,9 +1106,11 @@ public sealed class HeartbeatSupervisor : IHeartbeatSupervisor
                 }
                 else
                 {
-                    if (_authorizationStatus != DeviceAuthorizationStatus.Authorized)
+                    // ARGON-3.4-001: Never transition to Authorized before the server returns a valid HTTP 200.
+                    // Place unverified credentials in PendingVerification while the heartbeat is in flight.
+                    if (_authorizationStatus is not (DeviceAuthorizationStatus.Authorized or DeviceAuthorizationStatus.PendingVerification))
                     {
-                        _authorizationStatus = DeviceAuthorizationStatus.Authorized;
+                        _authorizationStatus = DeviceAuthorizationStatus.PendingVerification;
                         _boundDeviceId = credentialDeviceId;
                         _boundServerOrigin = credentialOrigin;
                         initialBindSnapshot = BuildSnapshotUnsafe();
@@ -834,7 +1190,7 @@ public sealed class HeartbeatSupervisor : IHeartbeatSupervisor
             // Ignore stale in-flight completions after epoch change, newer applied sequence, or revocation.
             if (capturedEpoch != _epoch ||
                 sequence <= _latestAppliedSequence ||
-                _authorizationStatus != DeviceAuthorizationStatus.Authorized ||
+                _authorizationStatus is not (DeviceAuthorizationStatus.Authorized or DeviceAuthorizationStatus.PendingVerification) ||
                 _boundDeviceId != credentialDeviceId)
             {
                 return result;
@@ -851,6 +1207,8 @@ public sealed class HeartbeatSupervisor : IHeartbeatSupervisor
 
             if (result.Succeeded)
             {
+                // ARGON-3.4-001: Only a valid HTTP 200 heartbeat response promotes PendingVerification -> Authorized.
+                _authorizationStatus = DeviceAuthorizationStatus.Authorized;
                 _connectivityState = HeartbeatConnectivityState.Healthy;
                 _boundServerOrigin = credentialOrigin;
                 _consecutiveTransientFailures = 0;
@@ -861,7 +1219,8 @@ public sealed class HeartbeatSupervisor : IHeartbeatSupervisor
             }
             else
             {
-                // Transient outage/5xx/timeout/captive-portal never revokes device pairing.
+                // Transient outage/5xx/timeout/captive-portal never revokes device pairing,
+                // and never promotes an unverified PendingVerification credential to Authorized.
                 _consecutiveTransientFailures++;
                 _totalTransientFailureCount++;
                 _connectivityState = _consecutiveTransientFailures >= _options.ConsecutiveFailuresBeforeDisconnected
@@ -890,10 +1249,9 @@ public sealed class HeartbeatSupervisor : IHeartbeatSupervisor
         HeartbeatAttemptResult? originalResult = null)
     {
         var now = _timeProvider.GetUtcNow();
-        DeviceRevokedEventArgs? revokedArgs = null;
-        HeartbeatSnapshot? snapshotToPublish = null;
         CancellationTokenSource? ctsToCancel = null;
         bool wasStaleEpoch;
+        bool performRevocationSideEffects = false;
 
         lock (_stateLock)
         {
@@ -912,6 +1270,7 @@ public sealed class HeartbeatSupervisor : IHeartbeatSupervisor
             else
             {
                 wasStaleEpoch = false;
+                performRevocationSideEffects = true;
                 _epoch++;
                 _authorizationStatus = DeviceAuthorizationStatus.Revoked;
                 _connectivityState = HeartbeatConnectivityState.Revoked;
@@ -919,15 +1278,14 @@ public sealed class HeartbeatSupervisor : IHeartbeatSupervisor
                 _lastAttemptAtUtc = now;
                 _lastOutcome = originalResult?.Outcome ?? HeartbeatOutcomeKind.Revoked;
                 _lastErrorDetail = reason;
-                revokedArgs = new DeviceRevokedEventArgs(revokedDeviceId, now, serverErrorCode, reason);
-                _lastRevocationDetails = revokedArgs;
+                _lastRevocationDetails = new DeviceRevokedEventArgs(revokedDeviceId, now, serverErrorCode, reason);
                 ctsToCancel = _runningCts;
-                snapshotToPublish = BuildSnapshotUnsafe();
             }
         }
 
         if (wasStaleEpoch)
         {
+            _ = await TryPersistTombstoneWithRetryAsync(revokedDeviceId, now).ConfigureAwait(false);
             return originalResult ?? HeartbeatAttemptResult.Failure(
                 HeartbeatOutcomeKind.Cancelled,
                 "Stale revocation response ignored because device was already re-paired.",
@@ -936,15 +1294,44 @@ public sealed class HeartbeatSupervisor : IHeartbeatSupervisor
 
         if (ctsToCancel is not null)
         {
-            await ctsToCancel.CancelAsync().ConfigureAwait(false);
+            try
+            {
+                await ctsToCancel.CancelAsync().ConfigureAwait(false);
+            }
+            catch (ObjectDisposedException)
+            {
+                // Ignore if already disposed.
+            }
         }
 
-        if (revokedArgs is not null)
+        if (performRevocationSideEffects)
         {
-            await ExecuteRevocationSideEffectsAsync(revokedDeviceId, ct).ConfigureAwait(false);
-            RevocationConfirmed?.Invoke(this, revokedArgs);
-            if (snapshotToPublish is not null)
+            var cleanup = await ExecuteRevocationSideEffectsAsync(revokedDeviceId, now, ct).ConfigureAwait(false);
+            DeviceRevokedEventArgs revokedArgs;
+            HeartbeatSnapshot snapshotToPublish;
+
+            lock (_stateLock)
             {
+                _lastCredentialPurgeSucceeded = cleanup.CredentialPurgeSucceeded;
+                _lastTombstonePersisted = cleanup.TombstonePersisted;
+                _lastInputResetSucceeded = cleanup.InputResetSucceeded;
+                _lastCleanupErrorDetail = cleanup.CleanupErrorDetail;
+                revokedArgs = new DeviceRevokedEventArgs(
+                    revokedDeviceId,
+                    now,
+                    serverErrorCode,
+                    reason,
+                    cleanup.CredentialPurgeSucceeded,
+                    cleanup.TombstonePersisted,
+                    cleanup.InputResetSucceeded,
+                    cleanup.CleanupErrorDetail);
+                _lastRevocationDetails = revokedArgs;
+                snapshotToPublish = BuildSnapshotUnsafe();
+            }
+
+            if (Volatile.Read(ref _disposed) == 0)
+            {
+                RevocationConfirmed?.Invoke(this, revokedArgs);
                 SnapshotChanged?.Invoke(this, snapshotToPublish);
             }
         }
@@ -990,12 +1377,19 @@ public sealed class HeartbeatSupervisor : IHeartbeatSupervisor
 
         if (ctsToCancel is not null)
         {
-            await ctsToCancel.CancelAsync().ConfigureAwait(false);
+            try
+            {
+                await ctsToCancel.CancelAsync().ConfigureAwait(false);
+            }
+            catch (ObjectDisposedException)
+            {
+                // Ignore if already disposed.
+            }
         }
 
         if (terminated)
         {
-            await TerminateActiveSessionAsync(ct).ConfigureAwait(false);
+            _ = await TerminateActiveSessionAndResetInputsAsync(ct).ConfigureAwait(false);
             if (snapshot is not null)
             {
                 SnapshotChanged?.Invoke(this, snapshot);
@@ -1003,53 +1397,142 @@ public sealed class HeartbeatSupervisor : IHeartbeatSupervisor
         }
     }
 
-    private async Task ExecuteRevocationSideEffectsAsync(Guid? revokedDeviceId, CancellationToken ct)
+    private sealed record RevocationCleanupOutcome(
+        bool CredentialPurgeSucceeded,
+        bool TombstonePersisted,
+        bool InputResetSucceeded,
+        string? CleanupErrorDetail);
+
+    private async Task<RevocationCleanupOutcome> ExecuteRevocationSideEffectsAsync(
+        Guid? revokedDeviceId,
+        DateTimeOffset revokedAtUtc,
+        CancellationToken ct)
     {
-        if (_options.DeleteLocalCredentialOnRevocation)
+        List<string> errors = [];
+
+        // 1. ARGON-3.4-005: Immediately terminate any active or pending session and unconditionally
+        // reset all held inputs first so physical input cannot linger during disk I/O retries.
+        var (inputResetSucceeded, inputError) = await TerminateActiveSessionAndResetInputsAsync(ct).ConfigureAwait(false);
+        if (!inputResetSucceeded && inputError is not null)
         {
-            try
+            errors.Add(inputError);
+        }
+
+        // 2. ARGON-3.4-002: Persist durable revocation tombstone with bounded retries so a revoked
+        // DeviceId remains permanently blocked across process restarts even if credential deletion fails.
+        var tombstonePersisted = true;
+        if (revokedDeviceId is { } id && id != Guid.Empty)
+        {
+            var (persisted, tombstoneError) = await TryPersistTombstoneWithRetryAsync(id, revokedAtUtc).ConfigureAwait(false);
+            tombstonePersisted = persisted;
+            if (!persisted && tombstoneError is not null)
             {
-                // Verify we only delete the matching revoked device credential (or corrupted envelope),
-                // protecting a concurrent fresh pairing from accidental deletion.
-                using var current = await _credentialStore.LoadAsync(CancellationToken.None).ConfigureAwait(false);
-                if (current is not null &&
-                    (!revokedDeviceId.HasValue || current.Metadata.DeviceId == revokedDeviceId.Value))
-                {
-                    await _credentialStore.DeleteAsync(CancellationToken.None).ConfigureAwait(false);
-                }
-            }
-            catch (CredentialStoreCorruptedException)
-            {
-                try
-                {
-                    await _credentialStore.DeleteAsync(CancellationToken.None).ConfigureAwait(false);
-                }
-                catch (IOException)
-                {
-                    // Best-effort purge; memory revocation latch remains enforced.
-                }
-                catch (UnauthorizedAccessException)
-                {
-                    // Best-effort purge; memory revocation latch remains enforced.
-                }
-            }
-            catch (IOException)
-            {
-                // Best-effort purge; memory revocation latch remains enforced.
-            }
-            catch (UnauthorizedAccessException)
-            {
-                // Best-effort purge; memory revocation latch remains enforced.
+                errors.Add(tombstoneError);
             }
         }
 
-        await TerminateActiveSessionAsync(ct).ConfigureAwait(false);
+        // 3. ARGON-3.4-002 & NEW-003: Atomically purge local DPAPI credential only if it still
+        // matches the revoked DeviceId (or is corrupted), protecting a concurrent fresh pairing.
+        var credentialPurgeSucceeded = true;
+        if (_options.DeleteLocalCredentialOnRevocation)
+        {
+            var (purged, purgeError) = await TryDeleteRevokedCredentialWithRetryAsync(revokedDeviceId).ConfigureAwait(false);
+            credentialPurgeSucceeded = purged;
+            if (!purged && purgeError is not null)
+            {
+                errors.Add(purgeError);
+            }
+        }
+
+        var cleanupErrorDetail = errors.Count > 0 ? string.Join(" | ", errors) : null;
+        return new RevocationCleanupOutcome(
+            credentialPurgeSucceeded,
+            tombstonePersisted,
+            inputResetSucceeded,
+            cleanupErrorDetail);
     }
 
-    private async Task TerminateActiveSessionAsync(CancellationToken ct)
+    private async Task<(bool Succeeded, string? ErrorDetail)> TryPersistTombstoneWithRetryAsync(
+        Guid revokedDeviceId,
+        DateTimeOffset revokedAtUtc)
     {
-        var hadControl = _sessionStateMachine?.Terminate() ?? false;
-        if (_inputExecutor is not null && (hadControl || _sessionStateMachine is null))
+        Exception? lastException = null;
+        for (var attempt = 1; attempt <= _options.CredentialDeleteMaxAttempts; attempt++)
+        {
+            try
+            {
+                await _tombstoneStore.RecordRevokedAsync(revokedDeviceId, revokedAtUtc, CancellationToken.None).ConfigureAwait(false);
+                return (true, null);
+            }
+            catch (Exception ex)
+            {
+                lastException = ex;
+                if (attempt < _options.CredentialDeleteMaxAttempts && _options.CredentialDeleteRetryDelay > TimeSpan.Zero)
+                {
+                    await Task.Delay(_options.CredentialDeleteRetryDelay).ConfigureAwait(false);
+                }
+            }
+        }
+
+        return (false, $"Failed to persist durable revocation tombstone after {_options.CredentialDeleteMaxAttempts} attempts: {lastException?.Message}");
+    }
+
+    private async Task<(bool Succeeded, string? ErrorDetail)> TryDeleteRevokedCredentialWithRetryAsync(Guid? revokedDeviceId)
+    {
+        Exception? lastException = null;
+        for (var attempt = 1; attempt <= _options.CredentialDeleteMaxAttempts; attempt++)
+        {
+            try
+            {
+                if (revokedDeviceId is { } expectedId && expectedId != Guid.Empty)
+                {
+                    // ARGON NEW-003: Atomic conditional deletion under the credential store's internal gate.
+                    // Returns true if deleted (matching DeviceId, corrupted, or missing), or false if a
+                    // concurrent fresh pairing has already saved a valid credential for a different DeviceId.
+                    _ = await _credentialStore.DeleteIfMatchesAsync(expectedId, CancellationToken.None).ConfigureAwait(false);
+                }
+                else
+                {
+                    await _credentialStore.DeleteAsync(CancellationToken.None).ConfigureAwait(false);
+                }
+
+                return (true, null);
+            }
+            catch (Exception ex)
+            {
+                lastException = ex;
+                if (attempt < _options.CredentialDeleteMaxAttempts && _options.CredentialDeleteRetryDelay > TimeSpan.Zero)
+                {
+                    await Task.Delay(_options.CredentialDeleteRetryDelay).ConfigureAwait(false);
+                }
+            }
+        }
+
+        return (false, $"Failed to delete revoked local credential after {_options.CredentialDeleteMaxAttempts} attempts: {lastException?.Message}");
+    }
+
+    private async Task<(bool InputResetSucceeded, string? ErrorDetail)> TerminateActiveSessionAndResetInputsAsync(
+        CancellationToken ct)
+    {
+        List<string> errors = [];
+
+        if (_sessionStateMachine is not null)
+        {
+            try
+            {
+                _ = _sessionStateMachine.Terminate();
+            }
+            catch (Exception ex)
+            {
+                errors.Add($"Session termination failed: {ex.Message}");
+            }
+        }
+
+        // ARGON-3.4-005: Unconditionally reset all held inputs whenever an IInputExecutor is attached,
+        // regardless of the session state prior to termination (ActiveFullControl, ActiveViewOnly,
+        // Paused, LockedOrUnavailable, AwaitingOwnerApproval, or Idle).
+        var inputResetSucceeded = true;
+        if (_inputExecutor is not null)
         {
             try
             {
@@ -1059,13 +1542,18 @@ public sealed class HeartbeatSupervisor : IHeartbeatSupervisor
             }
             catch (OperationCanceledException) when (!ct.IsCancellationRequested)
             {
-                // Best-effort safety release on teardown.
+                inputResetSucceeded = false;
+                errors.Add("Input reset was cancelled unexpectedly during session teardown.");
             }
-            catch (InvalidOperationException)
+            catch (Exception ex)
             {
-                // Best-effort safety release on teardown.
+                inputResetSucceeded = false;
+                errors.Add($"InputResetFailed: {ex.Message}");
             }
         }
+
+        var errorDetail = errors.Count > 0 ? string.Join(" | ", errors) : null;
+        return (inputResetSucceeded && errors.Count == 0, errorDetail);
     }
 
     private HeartbeatSnapshot BuildSnapshotUnsafe() =>
@@ -1083,5 +1571,9 @@ public sealed class HeartbeatSupervisor : IHeartbeatSupervisor
             _lastAttemptAtUtc,
             _revokedAtUtc,
             _lastOutcome,
-            _lastErrorDetail);
+            _lastErrorDetail,
+            _lastCredentialPurgeSucceeded,
+            _lastTombstonePersisted,
+            _lastInputResetSucceeded,
+            _lastCleanupErrorDetail);
 }

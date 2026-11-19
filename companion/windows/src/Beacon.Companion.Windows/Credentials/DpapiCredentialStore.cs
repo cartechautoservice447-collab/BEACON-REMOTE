@@ -229,6 +229,64 @@ public sealed class DpapiCredentialStore : ICredentialStore, IDisposable
         }
     }
 
+    public async Task<bool> DeleteIfMatchesAsync(Guid expectedDeviceId, CancellationToken ct = default)
+    {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+        if (expectedDeviceId == Guid.Empty)
+        {
+            throw new ArgumentException("Expected DeviceId cannot be Guid.Empty.", nameof(expectedDeviceId));
+        }
+
+        await _gate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            if (!File.Exists(_filePath))
+            {
+                return true;
+            }
+
+            var shouldDelete = false;
+            try
+            {
+                var info = new FileInfo(_filePath);
+                if (info.Length is < MinEnvelopeBytes or > MaxEnvelopeBytes)
+                {
+                    shouldDelete = true;
+                }
+                else
+                {
+                    var envelopeBytes = await File.ReadAllBytesAsync(_filePath, ct).ConfigureAwait(false);
+                    using var loaded = UnpackAndDecryptEnvelope(envelopeBytes, _entropyPrefix);
+                    if (loaded.Metadata.DeviceId == expectedDeviceId)
+                    {
+                        shouldDelete = true;
+                    }
+                    else
+                    {
+                        // A valid credential for a different DeviceId (e.g. a concurrent fresh pairing)
+                        // is now stored; preserve it and return false.
+                        return false;
+                    }
+                }
+            }
+            catch (CredentialStoreCorruptedException)
+            {
+                shouldDelete = true;
+            }
+
+            if (shouldDelete)
+            {
+                BestEffortOverwriteAndDeleteFile(_filePath);
+            }
+
+            return true;
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) == 0)

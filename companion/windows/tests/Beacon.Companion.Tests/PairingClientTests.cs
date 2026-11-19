@@ -492,6 +492,24 @@ public sealed class PairingClientTests
             return Task.CompletedTask;
         }
 
+        public Task<bool> DeleteIfMatchesAsync(Guid expectedDeviceId, CancellationToken ct = default)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (_stored is null || _stored.IsDisposed)
+            {
+                return Task.FromResult(true);
+            }
+
+            if (_stored.Metadata.DeviceId != expectedDeviceId)
+            {
+                return Task.FromResult(false);
+            }
+
+            _stored.Dispose();
+            _stored = null;
+            return Task.FromResult(true);
+        }
+
         public void Dispose() => _stored?.Dispose();
     }
 

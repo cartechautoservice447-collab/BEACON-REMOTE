@@ -326,11 +326,14 @@ type SharedHeartbeatFixture = {
   endpointPath: string;
   method: string;
   authorizationHeaderPrefix: string;
+  requiredResponseHeaders: { cacheControl: string };
   tokenLength: { min: number; max: number };
   onlineWindowMs: number;
   recommendedIntervalMs: number;
   valid200Responses: Array<{ name: string; json: string }>;
   invalid200Responses: Array<{ name: string; json: string }>;
+  recognizedRevocationErrorCodes: string[];
+  untrusted401Responses: Array<{ name: string; body: string }>;
   revocation401Response: string;
   serverError500Response: string;
 };
@@ -338,6 +341,11 @@ type SharedHeartbeatFixture = {
 const HEARTBEAT_FIXTURE_PATH = path.resolve(
   process.cwd(),
   "companion/windows/tests/Beacon.Companion.Tests/Fixtures/heartbeat-protocol-contract.json",
+);
+
+const HEARTBEAT_ROUTE_PATH = path.resolve(
+  process.cwd(),
+  "src/routes/api/public/agent/heartbeat.ts",
 );
 
 const heartbeatFixture: SharedHeartbeatFixture = JSON.parse(
@@ -360,16 +368,47 @@ function isValidHeartbeat200FromTsContract(rawJson: string): boolean {
   );
 }
 
+function isStrictConfirmedRevocation401Body(raw: string): boolean {
+  if (raw.trim().length === 0) return false;
+
+  // Reject duplicate "error" keys before JSON.parse collapses them.
+  const errorKeyMatches = raw.match(/"error"\s*:/g);
+  if (!errorKeyMatches || errorKeyMatches.length !== 1) return false;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return false;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+  const obj = parsed as Record<string, unknown>;
+  const errorCode = obj["error"];
+  return (
+    typeof errorCode === "string" &&
+    errorCode.trim().length > 0 &&
+    heartbeatFixture.recognizedRevocationErrorCodes.includes(errorCode)
+  );
+}
+
 describe("cross-language TypeScript <-> C# Step 3.4 heartbeat protocol contract", () => {
-  test("shared heartbeat fixture matches /api/public/agent/heartbeat endpoint and response schema", async () => {
+  test("shared heartbeat fixture matches /api/public/agent/heartbeat endpoint, Cache-Control: no-store, and response schema", async () => {
     const { HEARTBEAT_ONLINE_WINDOW_MS } = await import("@/lib/pairing");
 
     expect(heartbeatFixture.endpointPath).toBe("/api/public/agent/heartbeat");
     expect(heartbeatFixture.method).toBe("POST");
     expect(heartbeatFixture.authorizationHeaderPrefix).toBe("Bearer ");
+    expect(heartbeatFixture.requiredResponseHeaders).toEqual({ cacheControl: "no-store" });
     expect(heartbeatFixture.tokenLength).toEqual({ min: 20, max: 128 });
     expect(heartbeatFixture.onlineWindowMs).toBe(HEARTBEAT_ONLINE_WINDOW_MS);
     expect(heartbeatFixture.recommendedIntervalMs).toBeLessThan(heartbeatFixture.onlineWindowMs);
+
+    const routeSource = readFileSync(HEARTBEAT_ROUTE_PATH, "utf8");
+    expect(routeSource).toContain('"Cache-Control": "no-store"');
+    const jsonCalls = routeSource.match(/Response\.json\(/g) ?? [];
+    const noStoreUsages = routeSource.match(/headers:\s*NO_STORE_HEADERS/g) ?? [];
+    expect(jsonCalls.length).toBe(4);
+    expect(noStoreUsages.length).toBe(4);
 
     for (const entry of heartbeatFixture.valid200Responses) {
       expect(isValidHeartbeat200FromTsContract(entry.json), entry.name).toBe(true);
@@ -381,5 +420,17 @@ describe("cross-language TypeScript <-> C# Step 3.4 heartbeat protocol contract"
 
     expect(JSON.parse(heartbeatFixture.revocation401Response)).toEqual({ error: "unauthorized" });
     expect(JSON.parse(heartbeatFixture.serverError500Response)).toEqual({ error: "server_error" });
+  });
+
+  test("Argon audit remediation (ARGON-3.4-003 & ARGON-3.4-004): strict 401 revocation contract rejects empty, whitespace, duplicate-key, trailing-token, and unknown error payloads", () => {
+    expect(isStrictConfirmedRevocation401Body(heartbeatFixture.revocation401Response)).toBe(true);
+
+    for (const code of heartbeatFixture.recognizedRevocationErrorCodes) {
+      expect(isStrictConfirmedRevocation401Body(JSON.stringify({ error: code })), code).toBe(true);
+    }
+
+    for (const untrusted of heartbeatFixture.untrusted401Responses) {
+      expect(isStrictConfirmedRevocation401Body(untrusted.body), untrusted.name).toBe(false);
+    }
   });
 });

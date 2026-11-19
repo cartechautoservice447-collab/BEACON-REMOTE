@@ -207,7 +207,8 @@ public sealed class HeartbeatClient : IHeartbeatClient
                 }
 
                 var responseSpan = responseBuffer.AsSpan(0, bytesRead);
-                return ClassifyResponse(deviceId, statusCode, response.Headers.RetryAfter, responseSpan);
+                var responseMediaType = response.Content.Headers.ContentType?.MediaType;
+                return ClassifyResponse(deviceId, statusCode, responseMediaType, response.Headers.RetryAfter, responseSpan);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -260,14 +261,27 @@ public sealed class HeartbeatClient : IHeartbeatClient
         }
     }
 
+    private static bool IsJsonMediaType(string? mediaType) =>
+        string.Equals(mediaType, "application/json", StringComparison.OrdinalIgnoreCase);
+
     private static HeartbeatAttemptResult ClassifyResponse(
         Guid deviceId,
         int statusCode,
+        string? responseMediaType,
         RetryConditionHeaderValue? retryAfterHeader,
         ReadOnlySpan<byte> bodyUtf8)
     {
         if (statusCode == (int)HttpStatusCode.OK)
         {
+            if (!IsJsonMediaType(responseMediaType))
+            {
+                return HeartbeatAttemptResult.Failure(
+                    HeartbeatOutcomeKind.MalformedResponse,
+                    "Server returned HTTP 200 without an application/json Content-Type.",
+                    deviceId: deviceId,
+                    httpStatusCode: statusCode);
+            }
+
             if (TryParseSuccessBody(bodyUtf8, out var serverTimeUtc, out var parseError))
             {
                 return HeartbeatAttemptResult.Success(deviceId, serverTimeUtc, statusCode);
@@ -282,19 +296,23 @@ public sealed class HeartbeatClient : IHeartbeatClient
 
         if (statusCode == (int)HttpStatusCode.Unauthorized)
         {
-            // Backend returns 401 { "error": "unauthorized" } when device_credentials are deleted or revoked.
-            // Guard against non-JSON captive-portal HTML falsely wiping local DPAPI credentials.
-            if (IsWhitespaceOnlyUtf8(bodyUtf8))
+            // ARGON-3.4-003 & ARGON-3.4-004:
+            // Only an explicit application/json response containing a strict JSON object with a single
+            // non-empty, recognized backend "error" code (e.g. {"error":"unauthorized"}) confirms server revocation.
+            // Wrong Content-Type headers, empty/whitespace bodies, non-JSON captive-portal responses,
+            // duplicate "error" keys, trailing JSON tokens, and unrecognized proxy/gateway error codes
+            // are classified as MalformedResponse (transient/retryable) so local DPAPI credentials are never wiped falsely.
+            if (!IsJsonMediaType(responseMediaType))
             {
                 return HeartbeatAttemptResult.Failure(
-                    HeartbeatOutcomeKind.Revoked,
-                    "Server rejected the device credential with HTTP 401.",
+                    HeartbeatOutcomeKind.MalformedResponse,
+                    "Received HTTP 401 without an application/json Content-Type (possible proxy or captive portal interception).",
                     deviceId: deviceId,
                     httpStatusCode: statusCode,
-                    serverErrorCode: "unauthorized");
+                    serverErrorCode: null);
             }
 
-            if (TryReadJsonErrorCode(bodyUtf8, out var errorCode))
+            if (TryReadStrictJsonErrorCode(bodyUtf8, out var errorCode))
             {
                 if (IsConfirmedRejectionErrorCode(errorCode))
                 {
@@ -303,27 +321,38 @@ public sealed class HeartbeatClient : IHeartbeatClient
                         "Server confirmed the device credential is unauthorized or revoked.",
                         deviceId: deviceId,
                         httpStatusCode: statusCode,
-                        serverErrorCode: errorCode ?? "unauthorized");
+                        serverErrorCode: errorCode);
                 }
 
                 return HeartbeatAttemptResult.Failure(
-                    HeartbeatOutcomeKind.Revoked,
-                    "Server rejected the device credential with HTTP 401 JSON error.",
+                    HeartbeatOutcomeKind.MalformedResponse,
+                    "Received HTTP 401 with an unrecognized error code (possible proxy or gateway interception).",
                     deviceId: deviceId,
                     httpStatusCode: statusCode,
-                    serverErrorCode: errorCode);
+                    serverErrorCode: SanitizeDiagnosticErrorCode(errorCode));
             }
 
             return HeartbeatAttemptResult.Failure(
                 HeartbeatOutcomeKind.MalformedResponse,
-                "Received HTTP 401 with a non-JSON body (possible captive portal or proxy interception).",
+                "Received HTTP 401 without a recognized Beacon revocation JSON payload (possible proxy or captive portal interception).",
                 deviceId: deviceId,
-                httpStatusCode: statusCode);
+                httpStatusCode: statusCode,
+                serverErrorCode: null);
         }
 
         if (statusCode == (int)HttpStatusCode.Forbidden)
         {
-            if (TryReadJsonErrorCode(bodyUtf8, out var errorCode))
+            if (!IsJsonMediaType(responseMediaType))
+            {
+                return HeartbeatAttemptResult.Failure(
+                    HeartbeatOutcomeKind.MalformedResponse,
+                    "Received HTTP 403 without an application/json Content-Type (possible proxy or WAF interception).",
+                    deviceId: deviceId,
+                    httpStatusCode: statusCode,
+                    serverErrorCode: null);
+            }
+
+            if (TryReadStrictJsonErrorCode(bodyUtf8, out var errorCode))
             {
                 if (IsConfirmedRejectionErrorCode(errorCode))
                 {
@@ -336,51 +365,79 @@ public sealed class HeartbeatClient : IHeartbeatClient
                 }
 
                 return HeartbeatAttemptResult.Failure(
-                    HeartbeatOutcomeKind.Forbidden,
-                    "Server returned HTTP 403 Forbidden for the heartbeat request.",
+                    HeartbeatOutcomeKind.MalformedResponse,
+                    "Received HTTP 403 with an unrecognized error code.",
                     deviceId: deviceId,
                     httpStatusCode: statusCode,
-                    serverErrorCode: errorCode);
+                    serverErrorCode: SanitizeDiagnosticErrorCode(errorCode));
             }
 
             return HeartbeatAttemptResult.Failure(
                 HeartbeatOutcomeKind.MalformedResponse,
-                "Received HTTP 403 with a non-JSON response body.",
+                "Received HTTP 403 without a recognized Beacon revocation JSON payload.",
                 deviceId: deviceId,
-                httpStatusCode: statusCode);
+                httpStatusCode: statusCode,
+                serverErrorCode: null);
         }
 
         if (statusCode is (int)HttpStatusCode.RequestTimeout or (int)HttpStatusCode.TooManyRequests ||
             statusCode is >= 500 and <= 599)
         {
-            _ = TryReadJsonErrorCode(bodyUtf8, out var errorCode);
+            _ = TryReadStrictJsonErrorCode(bodyUtf8, out var errorCode);
             var retryHint = ExtractBoundedRetryAfter(retryAfterHeader);
             return HeartbeatAttemptResult.Failure(
                 HeartbeatOutcomeKind.TransientServerError,
                 $"Server temporarily unavailable (HTTP {statusCode}).",
                 deviceId: deviceId,
                 httpStatusCode: statusCode,
-                serverErrorCode: errorCode,
+                serverErrorCode: SanitizeDiagnosticErrorCode(errorCode),
                 retryAfterHint: retryHint);
         }
 
-        _ = TryReadJsonErrorCode(bodyUtf8, out var unexpectedErrorCode);
+        _ = TryReadStrictJsonErrorCode(bodyUtf8, out var unexpectedErrorCode);
         return HeartbeatAttemptResult.Failure(
             HeartbeatOutcomeKind.MalformedResponse,
             $"Unexpected HTTP {statusCode} response from heartbeat endpoint.",
             deviceId: deviceId,
             httpStatusCode: statusCode,
-            serverErrorCode: unexpectedErrorCode);
+            serverErrorCode: SanitizeDiagnosticErrorCode(unexpectedErrorCode));
     }
 
+    public const int MaxDiagnosticErrorCodeLength = 64;
+
     private static bool IsConfirmedRejectionErrorCode(string? errorCode) =>
-        errorCode is null or
+        errorCode is
             "unauthorized" or
             "revoked" or
             "device_revoked" or
             "credential_revoked" or
             "invalid_token" or
             "token_expired";
+
+    private static string? SanitizeDiagnosticErrorCode(string? rawErrorCode)
+    {
+        if (string.IsNullOrWhiteSpace(rawErrorCode))
+        {
+            return null;
+        }
+
+        if (rawErrorCode.Length > MaxDiagnosticErrorCodeLength)
+        {
+            return "untrusted_error_code";
+        }
+
+        foreach (var ch in rawErrorCode)
+        {
+            var isSafeAsciiIdentifier =
+                ch is (>= 'a' and <= 'z') or (>= 'A' and <= 'Z') or (>= '0' and <= '9') or '_' or '-' or '.';
+            if (!isSafeAsciiIdentifier)
+            {
+                return "untrusted_error_code";
+            }
+        }
+
+        return rawErrorCode;
+    }
 
     private static TimeSpan? ExtractBoundedRetryAfter(RetryConditionHeaderValue? header)
     {
@@ -504,13 +561,16 @@ public sealed class HeartbeatClient : IHeartbeatClient
         return true;
     }
 
-    private static bool TryReadJsonErrorCode(ReadOnlySpan<byte> utf8Json, out string? errorCode)
+    private static bool TryReadStrictJsonErrorCode(ReadOnlySpan<byte> utf8Json, out string? errorCode)
     {
         errorCode = null;
         if (IsWhitespaceOnlyUtf8(utf8Json))
         {
             return false;
         }
+
+        string? parsedError = null;
+        var sawErrorProperty = false;
 
         try
         {
@@ -540,16 +600,15 @@ public sealed class HeartbeatClient : IHeartbeatClient
 
                 if (reader.ValueTextEquals("error"u8))
                 {
-                    if (!reader.Read())
+                    // Reject duplicate "error" properties or non-string / empty values.
+                    if (sawErrorProperty || !reader.Read() || reader.TokenType != JsonTokenType.String)
                     {
                         return false;
                     }
 
-                    if (reader.TokenType == JsonTokenType.String)
-                    {
-                        errorCode = reader.GetString();
-                    }
-                    else if (reader.TokenType != JsonTokenType.Null)
+                    sawErrorProperty = true;
+                    parsedError = reader.GetString();
+                    if (string.IsNullOrWhiteSpace(parsedError))
                     {
                         return false;
                     }
@@ -565,6 +624,18 @@ public sealed class HeartbeatClient : IHeartbeatClient
                 }
             }
 
+            // Reject trailing tokens after the root JSON object.
+            if (reader.Read())
+            {
+                return false;
+            }
+
+            if (!sawErrorProperty || string.IsNullOrWhiteSpace(parsedError))
+            {
+                return false;
+            }
+
+            errorCode = parsedError;
             return true;
         }
         catch (JsonException)

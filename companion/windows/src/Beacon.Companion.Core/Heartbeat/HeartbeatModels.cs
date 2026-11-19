@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text.Json.Serialization;
 using Beacon.Companion.Core.Configuration;
 
@@ -6,6 +7,8 @@ namespace Beacon.Companion.Core.Heartbeat;
 /// <summary>
 /// Authoritative companion pairing and server authorization state.
 /// Distinct from transient network connectivity so temporary outages do not erase pairing,
+/// locally loaded or newly paired credentials remain in <see cref="PendingVerification"/> until
+/// a valid server heartbeat (<c>HTTP 200 {"ok":true}</c>) confirms active registration,
 /// and confirmed server revocation is latched until a fresh authorized pairing succeeds.
 /// </summary>
 public enum DeviceAuthorizationStatus
@@ -14,6 +17,7 @@ public enum DeviceAuthorizationStatus
     Authorized = 1,
     Revoked = 2,
     CredentialInvalid = 3,
+    PendingVerification = 4,
 }
 
 /// <summary>
@@ -45,6 +49,41 @@ public enum HeartbeatOutcomeKind
     MalformedResponse = 7,
     UnexpectedRedirect = 8,
     InvalidCredential = 9,
+}
+
+/// <summary>
+/// Durable or process-scoped revocation tombstone store that prevents a revoked <c>DeviceId</c>
+/// from regaining operational authorization even if local DPAPI credential deletion fails
+/// or the companion process restarts.
+/// </summary>
+public interface IRevocationTombstoneStore
+{
+    Task<bool> IsRevokedAsync(Guid deviceId, CancellationToken ct = default);
+
+    Task RecordRevokedAsync(Guid deviceId, DateTimeOffset revokedAtUtc, CancellationToken ct = default);
+}
+
+/// <summary>
+/// Thread-safe in-memory implementation of <see cref="IRevocationTombstoneStore"/>.
+/// Can be shared across supervisor instances in tests to simulate durable persistence across process restarts;
+/// Windows production deployments use <c>DpapiRevocationTombstoneStore</c>.
+/// </summary>
+public sealed class InMemoryRevocationTombstoneStore : IRevocationTombstoneStore
+{
+    private readonly ConcurrentDictionary<Guid, DateTimeOffset> _tombstones = new();
+
+    public Task<bool> IsRevokedAsync(Guid deviceId, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        return Task.FromResult(_tombstones.ContainsKey(deviceId));
+    }
+
+    public Task RecordRevokedAsync(Guid deviceId, DateTimeOffset revokedAtUtc, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        _tombstones[deviceId] = revokedAtUtc;
+        return Task.CompletedTask;
+    }
 }
 
 /// <summary>
@@ -161,6 +200,16 @@ public sealed record HeartbeatSupervisorOptions
     /// </summary>
     public bool DeleteLocalCredentialOnRevocation { get; init; } = true;
 
+    /// <summary>
+    /// Bounded retry count for local credential deletion and revocation tombstone persistence during revocation cleanup.
+    /// </summary>
+    public int CredentialDeleteMaxAttempts { get; init; } = 3;
+
+    /// <summary>
+    /// Delay between bounded retry attempts when purging a revoked local credential or writing a revocation tombstone.
+    /// </summary>
+    public TimeSpan CredentialDeleteRetryDelay { get; init; } = TimeSpan.FromMilliseconds(20);
+
     public bool AllowDevelopmentLoopbackHttp { get; init; } = true;
 
     public string AgentVersion { get; init; } = "0.3.4";
@@ -204,6 +253,10 @@ public sealed record HeartbeatSupervisorOptions
         }
 
         ArgumentOutOfRangeException.ThrowIfLessThan(ConsecutiveFailuresBeforeDisconnected, 1);
+        ArgumentOutOfRangeException.ThrowIfLessThan(CredentialDeleteMaxAttempts, 1);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(CredentialDeleteMaxAttempts, 10);
+        ArgumentOutOfRangeException.ThrowIfLessThan(CredentialDeleteRetryDelay, TimeSpan.Zero);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(CredentialDeleteRetryDelay, TimeSpan.FromSeconds(5));
 
         if (string.IsNullOrWhiteSpace(AgentVersion) || AgentVersion.Trim().Length > 32)
         {
@@ -226,9 +279,15 @@ public sealed record HeartbeatSnapshot(
     DateTimeOffset? LastAttemptAtUtc,
     DateTimeOffset? RevokedAtUtc,
     HeartbeatOutcomeKind? LastOutcome,
-    string? LastErrorDetail)
+    string? LastErrorDetail,
+    bool? CredentialPurgeSucceeded = null,
+    bool? TombstonePersisted = null,
+    bool? InputResetSucceeded = null,
+    string? CleanupErrorDetail = null)
 {
     public bool IsAuthorized => AuthorizationStatus == DeviceAuthorizationStatus.Authorized;
+
+    public bool IsPendingVerification => AuthorizationStatus == DeviceAuthorizationStatus.PendingVerification;
 
     public bool IsRevoked => AuthorizationStatus == DeviceAuthorizationStatus.Revoked;
 }
@@ -237,7 +296,11 @@ public sealed class DeviceRevokedEventArgs(
     Guid? deviceId,
     DateTimeOffset revokedAtUtc,
     string? serverErrorCode,
-    string reason) : EventArgs
+    string reason,
+    bool credentialPurgeSucceeded = true,
+    bool tombstonePersisted = true,
+    bool inputResetSucceeded = true,
+    string? cleanupErrorDetail = null) : EventArgs
 {
     public Guid? DeviceId { get; } = deviceId;
 
@@ -246,6 +309,14 @@ public sealed class DeviceRevokedEventArgs(
     public string? ServerErrorCode { get; } = serverErrorCode;
 
     public string Reason { get; } = reason;
+
+    public bool CredentialPurgeSucceeded { get; } = credentialPurgeSucceeded;
+
+    public bool TombstonePersisted { get; } = tombstonePersisted;
+
+    public bool InputResetSucceeded { get; } = inputResetSucceeded;
+
+    public string? CleanupErrorDetail { get; } = cleanupErrorDetail;
 }
 
 public interface IJitterSource

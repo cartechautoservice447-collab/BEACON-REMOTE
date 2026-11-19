@@ -2,6 +2,9 @@
   "endpointPath": "/api/public/agent/heartbeat",
   "method": "POST",
   "authorizationHeaderPrefix": "Bearer ",
+  "requiredResponseHeaders": {
+    "cacheControl": "no-store"
+  },
   "tokenLength": {
     "min": 20,
     "max": 128
@@ -42,6 +45,40 @@
     {
       "name": "ok-string-instead-of-boolean",
       "json": "{\"ok\":\"true\",\"server_time\":\"2026-11-18T12:00:00.000Z\"}"
+    }
+  ],
+  "recognizedRevocationErrorCodes": [
+    "unauthorized",
+    "revoked",
+    "device_revoked",
+    "credential_revoked",
+    "invalid_token",
+    "token_expired"
+  ],
+  "untrusted401Responses": [
+    {
+      "name": "empty-body",
+      "body": ""
+    },
+    {
+      "name": "whitespace-body",
+      "body": "   \t\r\n  "
+    },
+    {
+      "name": "empty-json-object",
+      "body": "{}"
+    },
+    {
+      "name": "unknown-proxy-error-code",
+      "body": "{\"error\":\"proxy_auth_required\"}"
+    },
+    {
+      "name": "duplicate-error-property",
+      "body": "{\"error\":\"unauthorized\",\"error\":\"proxy_override\"}"
+    },
+    {
+      "name": "trailing-json-tokens",
+      "body": "{\"error\":\"unauthorized\"} trailing"
     }
   ],
   "revocation401Response": "{\"error\":\"unauthorized\"}",

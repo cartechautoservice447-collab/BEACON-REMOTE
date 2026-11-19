@@ -135,4 +135,13 @@ public interface ICredentialStore
     Task SaveAsync(DeviceCredential credential, CancellationToken ct = default);
 
     Task DeleteAsync(CancellationToken ct = default);
+
+    /// <summary>
+    /// Atomically verifies the stored credential under the store's internal synchronization gate
+    /// and deletes it if and only if no credential exists, the stored credential envelope is corrupted,
+    /// or the stored credential's <c>DeviceId</c> equals <paramref name="expectedDeviceId"/>.
+    /// Returns <see langword="false"/> without deleting if a valid credential for a different
+    /// <c>DeviceId</c> is stored (preventing a concurrent re-pairing TOCTOU overwrite/deletion).
+    /// </summary>
+    Task<bool> DeleteIfMatchesAsync(Guid expectedDeviceId, CancellationToken ct = default);
 }
