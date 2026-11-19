@@ -842,26 +842,16 @@ public sealed class PairingClient : IPairingClient
         ReadOnlySpan<char> sixDigits,
         PairingDeviceMetadata device)
     {
-        var bufferWriter = new ArrayBufferWriter<byte>(256);
-        try
+        using var bufferWriter = new PinnedZeroingBufferWriter(256);
+        using (var writer = new Utf8JsonWriter(bufferWriter))
         {
-            using (var writer = new Utf8JsonWriter(bufferWriter))
-            {
-                writer.WriteStartObject();
-                writer.WriteString("code"u8, sixDigits);
-                WriteDeviceObject(writer, device);
-                writer.WriteEndObject();
-            }
+            writer.WriteStartObject();
+            writer.WriteString("code"u8, sixDigits);
+            WriteDeviceObject(writer, device);
+            writer.WriteEndObject();
+        }
 
-            var written = bufferWriter.WrittenSpan;
-            var pinned = GC.AllocateArray<byte>(written.Length, pinned: true);
-            written.CopyTo(pinned);
-            return pinned;
-        }
-        finally
-        {
-            CryptographicOperations.ZeroMemory(MemoryMarshal.AsBytes(bufferWriter.WrittenSpan));
-        }
+        return bufferWriter.ToPinnedArray();
     }
 
     private static byte[] WriteQrPairingRequestUtf8(
@@ -869,26 +859,97 @@ public sealed class PairingClient : IPairingClient
         ReadOnlySpan<char> token,
         PairingDeviceMetadata device)
     {
-        var bufferWriter = new ArrayBufferWriter<byte>(384);
-        try
+        using var bufferWriter = new PinnedZeroingBufferWriter(384);
+        using (var writer = new Utf8JsonWriter(bufferWriter))
         {
-            using (var writer = new Utf8JsonWriter(bufferWriter))
+            writer.WriteStartObject();
+            writer.WriteString("pairing_id"u8, pairingId.ToString("D"));
+            writer.WriteString("token"u8, token);
+            WriteDeviceObject(writer, device);
+            writer.WriteEndObject();
+        }
+
+        return bufferWriter.ToPinnedArray();
+    }
+
+    /// <summary>
+    /// Minimal pinned <see cref="IBufferWriter{T}"/> for serializing secret pairing JSON payloads.
+    /// Owns a writable pinned <see cref="byte"/> array so both resized intermediate buffers and the
+    /// final backing buffer are deterministically zeroed via <see cref="CryptographicOperations.ZeroMemory(Span{byte})"/>.
+    /// </summary>
+    private sealed class PinnedZeroingBufferWriter : IBufferWriter<byte>, IDisposable
+    {
+        private byte[] _buffer;
+        private int _written;
+        private bool _disposed;
+
+        public PinnedZeroingBufferWriter(int initialCapacity)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegativeOrZero(initialCapacity);
+            _buffer = GC.AllocateArray<byte>(initialCapacity, pinned: true);
+        }
+
+        public void Advance(int count)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            ArgumentOutOfRangeException.ThrowIfNegative(count);
+            if (_written > _buffer.Length - count)
             {
-                writer.WriteStartObject();
-                writer.WriteString("pairing_id"u8, pairingId.ToString("D"));
-                writer.WriteString("token"u8, token);
-                WriteDeviceObject(writer, device);
-                writer.WriteEndObject();
+                throw new InvalidOperationException("Cannot advance past the end of the pinned buffer.");
             }
 
-            var written = bufferWriter.WrittenSpan;
-            var pinned = GC.AllocateArray<byte>(written.Length, pinned: true);
-            written.CopyTo(pinned);
-            return pinned;
+            _written += count;
         }
-        finally
+
+        public Memory<byte> GetMemory(int sizeHint = 0)
         {
-            CryptographicOperations.ZeroMemory(MemoryMarshal.AsBytes(bufferWriter.WrittenSpan));
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            EnsureCapacity(sizeHint);
+            return _buffer.AsMemory(_written);
+        }
+
+        public Span<byte> GetSpan(int sizeHint = 0)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            EnsureCapacity(sizeHint);
+            return _buffer.AsSpan(_written);
+        }
+
+        public byte[] ToPinnedArray()
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            var copy = GC.AllocateArray<byte>(_written, pinned: true);
+            _buffer.AsSpan(0, _written).CopyTo(copy);
+            return copy;
+        }
+
+        public void Dispose()
+        {
+            if (!_disposed)
+            {
+                CryptographicOperations.ZeroMemory(_buffer);
+                _written = 0;
+                _disposed = true;
+            }
+        }
+
+        private void EnsureCapacity(int sizeHint)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(sizeHint);
+            var required = sizeHint == 0 ? 1 : sizeHint;
+            if (_buffer.Length - _written >= required)
+            {
+                return;
+            }
+
+            var minNewLength = checked(_written + required);
+            var doubled = _buffer.Length <= int.MaxValue / 2 ? _buffer.Length * 2 : int.MaxValue;
+            var newLength = Math.Max(doubled, minNewLength);
+
+            var next = GC.AllocateArray<byte>(newLength, pinned: true);
+            _buffer.AsSpan(0, _written).CopyTo(next);
+            CryptographicOperations.ZeroMemory(_buffer);
+            _buffer = next;
         }
     }
 

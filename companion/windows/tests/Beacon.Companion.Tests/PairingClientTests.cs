@@ -343,7 +343,8 @@ public sealed class PairingClientTests
             var json = entry.GetProperty("json").GetString()!;
             var pinReq = JsonSerializer.Deserialize(json, PairingJsonContext.Default.SixDigitPinPairingRequest);
             Assert.NotNull(pinReq);
-            Assert.True(QrPairingPayloadValidator.IsValidSixDigitPin(pinReq.Code));
+            Assert.Equal(6, pinReq.Code.Length);
+            Assert.All(pinReq.Code, ch => Assert.True(char.IsAsciiDigit(ch)));
             Assert.False(string.IsNullOrWhiteSpace(pinReq.Device.Name));
         }
 
@@ -352,8 +353,8 @@ public sealed class PairingClientTests
             var json = entry.GetProperty("json").GetString()!;
             var qrReq = JsonSerializer.Deserialize(json, PairingJsonContext.Default.QrTokenPairingRequest);
             Assert.NotNull(qrReq);
-            Assert.True(Guid.TryParse(qrReq.PairingId, out _));
-            Assert.True(QrPairingPayloadValidator.IsValidToken(qrReq.Token));
+            Assert.NotEqual(Guid.Empty, qrReq.PairingId);
+            Assert.True(QrPairingPayloadValidator.IsValidBase64UrlToken(qrReq.Token));
         }
 
         var responses = root.GetProperty("serverResponses");
@@ -361,8 +362,8 @@ public sealed class PairingClientTests
             responses.GetProperty("confirmed200").GetString()!,
             PairingJsonContext.Default.PairingSuccessResponse);
         Assert.NotNull(confirmed200);
-        Assert.True(Guid.TryParse(confirmed200.DeviceId, out _));
-        Assert.True(QrPairingPayloadValidator.IsValidToken(confirmed200.DeviceToken));
+        Assert.NotEqual(Guid.Empty, confirmed200.DeviceId);
+        Assert.True(DeviceCredential.IsValidTokenFormat(confirmed200.DeviceToken));
 
         ReadOnlySpan<string> errorProperties = ["invalidCode401", "expired410", "tooManyAttempts429", "serverError500"];
         foreach (var errProp in errorProperties)
@@ -372,6 +373,57 @@ public sealed class PairingClientTests
                 PairingJsonContext.Default.PairingErrorResponse);
             Assert.NotNull(err);
             Assert.False(string.IsNullOrWhiteSpace(err.Error));
+        }
+    }
+
+    [Fact]
+    public async Task SerializesLargeEscapedDeviceMetadataAcrossPinnedBufferGrowthForPinAndQrRequests()
+    {
+        // 64-char Name and 64-char Os with characters escaped as \u003C (~6 bytes each) exceed
+        // the initial 256/384-byte pinned writer capacity, exercising buffer growth and zeroing.
+        var escapedName = new string('<', 64);
+        var escapedOs = new string('>', 64);
+        var largeDevice = new PairingDeviceMetadata(escapedName, escapedOs, "0.3.3-rc1");
+        var expectedDeviceId = Guid.Parse("7c9e6679-7425-40de-944b-e07fc1f90ae7");
+        var bodies = new List<string>();
+
+        using var handler = new StubHttpMessageHandler((_, body) =>
+        {
+            bodies.Add(body);
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(
+                    $$"""{"device_id":"{{expectedDeviceId}}","device_token":"deviceToken_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456"}""",
+                    Encoding.UTF8,
+                    "application/json"),
+            };
+        });
+        using var httpClient = new HttpClient(handler);
+        using var store = new InMemoryCredentialStore();
+        var client = new PairingClient(
+            httpClient,
+            store,
+            new PairingClientOptions { ConfiguredServerOrigin = TrustedOrigin });
+
+        var pinResult = await client.PairWithPinAsync("654321".AsMemory(), largeDevice);
+        Assert.True(pinResult.Succeeded);
+
+        var qrJson = """{"v":1,"type":"beacon-pair","server":"https://beacon.example.com","pairing_id":"550e8400-e29b-41d4-a716-446655440000","token":"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmno01"}""";
+        var qrResult = await client.PairWithQrAsync(
+            qrJson,
+            largeDevice,
+            OriginApprovalMode.ConfiguredOriginOnly,
+            overwriteExistingCredential: true);
+        Assert.True(qrResult.Succeeded);
+
+        Assert.Equal(2, bodies.Count);
+        foreach (var body in bodies)
+        {
+            Assert.True(Encoding.UTF8.GetByteCount(body) > 512);
+            using var doc = JsonDocument.Parse(body);
+            var dev = doc.RootElement.GetProperty("device");
+            Assert.Equal(escapedName, dev.GetProperty("name").GetString());
+            Assert.Equal(escapedOs, dev.GetProperty("os").GetString());
         }
     }
 

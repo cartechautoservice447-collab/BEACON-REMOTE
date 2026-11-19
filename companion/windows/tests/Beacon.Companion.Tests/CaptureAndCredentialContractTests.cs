@@ -79,7 +79,11 @@ public sealed class CaptureAndCredentialContractTests
         Assert.Equal("0123456789abcdefghij", cred.Token.ToString());
         Assert.DoesNotContain("0123456789abcdefghij", cred.ToString(), StringComparison.Ordinal);
         Assert.Contains("[REDACTED]", cred.ToString(), StringComparison.Ordinal);
-        Assert.DoesNotContain("0123456789abcdefghij", cred.TokenBuffer.ToString(), StringComparison.Ordinal);
+
+        using (var sensitive = SensitiveCharBuffer.FromChars("0123456789abcdefghij"))
+        {
+            Assert.Equal("[REDACTED]", sensitive.ToString());
+        }
 
         cred.Dispose();
         Assert.True(cred.IsDisposed);
