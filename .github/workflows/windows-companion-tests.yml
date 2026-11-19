@@ -67,72 +67,81 @@ jobs:
 
       - name: Prepare test results directory
         shell: pwsh
-        run: New-Item -ItemType Directory -Force -Path TestResults | Out-Null
+        run: New-Item -ItemType Directory -Force -Path "${{ github.workspace }}/TestResults" | Out-Null
 
       - name: Run xUnit tests and generate TRX report
         id: test
-        run: >
-          dotnet test "${{ env.TEST_PROJECT }}"
-          --configuration Release
-          --no-build
-          --verbosity normal
-          --blame-crash
-          --blame-hang-timeout 60s
-          --diag:TestResults/vstest-diag.log
-          --logger "console;verbosity=detailed"
-          --logger "trx;LogFileName=beacon-companion-tests.trx"
-          --results-directory TestResults
-          -bl:TestResults/msbuild-test.binlog
-
-      - name: Print TRX & Test Host Failure Summary
-        if: ${{ always() }}
         shell: pwsh
         run: |
-          $trxFiles = Get-ChildItem -Path TestResults -Filter *.trx -Recurse -ErrorAction SilentlyContinue
-          if (-not $trxFiles) {
-            Write-Warning "No TRX files found under TestResults."
-          } else {
-            foreach ($trxFile in $trxFiles) {
-              [xml]$trx = Get-Content -Path $trxFile.FullName -Raw
-              $ns = New-Object System.Xml.XmlNamespaceManager($trx.NameTable)
-              $ns.AddNamespace("t", "http://microsoft.com/schemas/VisualStudio/TeamTest/2010")
-              $counters = $trx.SelectSingleNode("//t:ResultSummary/t:Counters", $ns)
-              $summary = $trx.SelectSingleNode("//t:ResultSummary", $ns)
-              Write-Host "=== TRX FILE: $($trxFile.Name) | Outcome: $($summary.outcome) ==="
-              if ($counters) {
-                $total = [int]$counters.total
-                $executed = [int]$counters.executed
-                $skipped = $total - $executed
-                Write-Host ("Total={0} Executed={1} Passed={2} Failed={3} Skipped={4} Error={5} Timeout={6} Aborted={7}" -f $total, $executed, $counters.passed, $counters.failed, $skipped, $counters.error, $counters.timeout, $counters.aborted)
-                "### TRX Summary ($($trxFile.Name)): Outcome=$($summary.outcome)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
-                "- Total: $total | Executed: $executed | Passed: $($counters.passed) | Failed: $($counters.failed) | Skipped: $skipped | Error: $($counters.error) | Aborted: $($counters.aborted)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
-              }
-              $nonPassed = $trx.SelectNodes("//t:UnitTestResult[@outcome!='Passed']", $ns)
-              foreach ($r in $nonPassed) {
-                $msgNode = $r.SelectSingleNode("t:Output/t:ErrorInfo/t:Message", $ns)
-                $stkNode = $r.SelectSingleNode("t:Output/t:ErrorInfo/t:StackTrace", $ns)
-                $msg = if ($msgNode) { $msgNode."#text" } else { "(no error message)" }
-                $stk = if ($stkNode) { $stkNode."#text" } else { "(no stack trace)" }
-                Write-Host "::error title=$($r.testName) ($($r.outcome))::$msg"
-                Write-Host $stk
-                "`n#### $($r.outcome): $($r.testName)`n``````text`n$msg`n$stk`n``````" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
-              }
-              $runInfos = $trx.SelectNodes("//t:ResultSummary/t:RunInfos/t:RunInfo", $ns)
-              foreach ($ri in $runInfos) {
-                $textNode = $ri.SelectSingleNode("t:Text", $ns)
-                $text = if ($textNode) { $textNode."#text" } else { "" }
-                Write-Host "[$($ri.outcome)] $text"
-              }
+          $resultsDir = "${{ github.workspace }}/TestResults"
+          dotnet test "${{ env.TEST_PROJECT }}" `
+            --configuration Release `
+            --no-build `
+            --verbosity normal `
+            --results-directory "$resultsDir" `
+            --logger "console;verbosity=detailed" `
+            --logger "trx;LogFileName=beacon-companion-tests.trx" `
+            --diag:"$resultsDir/vstest-diag.log" `
+            -bl:"$resultsDir/msbuild-test.binlog"
+          $testExitCode = $LASTEXITCODE
+
+          # If the test runner wrote any .trx under the project folder instead of root TestResults, copy it into TestResults
+          $allTrx = Get-ChildItem -Path "${{ github.workspace }}" -Filter *.trx -Recurse -ErrorAction SilentlyContinue
+          foreach ($f in $allTrx) {
+            if ($f.DirectoryName -ne (Resolve-Path $resultsDir).Path) {
+              Copy-Item -Path $f.FullName -Destination (Join-Path $resultsDir $f.Name) -Force
             }
           }
 
-      - name: Upload TRX & VSTest diagnostic artifacts
-        if: ${{ always() }}
+          exit $testExitCode
+
+      - name: Print TRX & Test Host Summary
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host "=== Discovering generated TRX files in TestResults ==="
+          $trxFiles = Get-ChildItem -Path "TestResults" -Filter *.trx -Recurse -ErrorAction SilentlyContinue
+          if (-not $trxFiles) {
+            Write-Error "No TRX files found under TestResults/**/*.trx!"
+            exit 1
+          }
+          foreach ($trxFile in $trxFiles) {
+            Write-Host "Found TRX: $($trxFile.FullName) ($($trxFile.Length) bytes)"
+            [xml]$trx = Get-Content -Path $trxFile.FullName -Raw
+            $ns = New-Object System.Xml.XmlNamespaceManager($trx.NameTable)
+            $ns.AddNamespace("t", "http://microsoft.com/schemas/VisualStudio/TeamTest/2010")
+            $counters = $trx.SelectSingleNode("//t:ResultSummary/t:Counters", $ns)
+            $summary = $trx.SelectSingleNode("//t:ResultSummary", $ns)
+            Write-Host "=== TRX FILE: $($trxFile.Name) | Outcome: $($summary.outcome) ==="
+            if ($counters) {
+              $total = [int]$counters.total
+              $executed = [int]$counters.executed
+              $skipped = $total - $executed
+              Write-Host ("Total={0} Executed={1} Passed={2} Failed={3} Skipped={4} Error={5} Timeout={6} Aborted={7}" -f $total, $executed, $counters.passed, $counters.failed, $skipped, $counters.error, $counters.timeout, $counters.aborted)
+              "### TRX Summary ($($trxFile.Name)): Outcome=$($summary.outcome)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+              "- Total: $total | Executed: $executed | Passed: $($counters.passed) | Failed: $($counters.failed) | Skipped: $skipped | Error: $($counters.error) | Aborted: $($counters.aborted)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+            }
+            $nonPassed = $trx.SelectNodes("//t:UnitTestResult[@outcome!='Passed']", $ns)
+            foreach ($r in $nonPassed) {
+              $msgNode = $r.SelectSingleNode("t:Output/t:ErrorInfo/t:Message", $ns)
+              $stkNode = $r.SelectSingleNode("t:Output/t:ErrorInfo/t:StackTrace", $ns)
+              $msg = if ($msgNode) { $msgNode."#text" } else { "(no error message)" }
+              $stk = if ($stkNode) { $stkNode."#text" } else { "(no stack trace)" }
+              Write-Host "::error title=$($r.testName) ($($r.outcome))::$msg"
+              Write-Host $stk
+              "`n#### $($r.outcome): $($r.testName)`n``````text`n$msg`n$stk`n``````" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+            }
+          }
+
+      - name: Upload TRX test report artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: beacon-companion-windows-trx
-          path: TestResults/**/*
-          if-no-files-found: warn
+          name: beacon-companion-tests
+          path: |
+            TestResults/**/*.trx
+            TestResults/*.trx
+          if-no-files-found: error
           retention-days: 30
 
   test-typescript-contract:
