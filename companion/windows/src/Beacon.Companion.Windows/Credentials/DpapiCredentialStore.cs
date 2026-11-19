@@ -186,10 +186,7 @@ public sealed class DpapiCredentialStore : ICredentialStore, IDisposable
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
         ArgumentNullException.ThrowIfNull(credential);
-        if (credential.IsDisposed)
-        {
-            throw new ObjectDisposedException(nameof(credential));
-        }
+        ObjectDisposedException.ThrowIf(credential.IsDisposed, credential);
 
         await _gate.WaitAsync(ct).ConfigureAwait(false);
         try
