@@ -134,10 +134,7 @@ public sealed class HeartbeatSupervisor : IHeartbeatSupervisor
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
         ct.ThrowIfCancellationRequested();
 
-        if (!TryEnterExecutionReservation())
-        {
-            throw new ObjectDisposedException(nameof(HeartbeatSupervisor));
-        }
+        ObjectDisposedException.ThrowIf(!TryEnterExecutionReservation(), this);
 
         try
         {
@@ -313,10 +310,7 @@ public sealed class HeartbeatSupervisor : IHeartbeatSupervisor
         // ARGON-3.4-006 & NEW-004: Reserve active execution slot and link to supervisor _lifetimeCts
         // so concurrent Dispose/DisposeAsync cancels in-flight work and never disposes
         // _heartbeatExecutionLock or _lifetimeCts while a thread is waiting on or releasing them.
-        if (!TryEnterExecutionReservation())
-        {
-            throw new ObjectDisposedException(nameof(HeartbeatSupervisor));
-        }
+        ObjectDisposedException.ThrowIf(!TryEnterExecutionReservation(), this);
 
         try
         {
@@ -368,10 +362,7 @@ public sealed class HeartbeatSupervisor : IHeartbeatSupervisor
         ct.ThrowIfCancellationRequested();
 
         // ARGON NEW-004: Enroll AcknowledgeFreshPairingAsync in supervisor lifetime reservation.
-        if (!TryEnterExecutionReservation())
-        {
-            throw new ObjectDisposedException(nameof(HeartbeatSupervisor));
-        }
+        ObjectDisposedException.ThrowIf(!TryEnterExecutionReservation(), this);
 
         try
         {
@@ -537,10 +528,7 @@ public sealed class HeartbeatSupervisor : IHeartbeatSupervisor
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
         // ARGON NEW-004: Enroll NotifyAuthorizationRevokedAsync in supervisor lifetime reservation.
-        if (!TryEnterExecutionReservation())
-        {
-            throw new ObjectDisposedException(nameof(HeartbeatSupervisor));
-        }
+        ObjectDisposedException.ThrowIf(!TryEnterExecutionReservation(), this);
 
         try
         {
