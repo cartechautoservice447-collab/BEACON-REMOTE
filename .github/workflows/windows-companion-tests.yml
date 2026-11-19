@@ -15,6 +15,7 @@ on:
       - "src/lib/remote/keys.ts"
       - "src/lib/pairing.ts"
       - "src/routes/api/public/agent/pair.ts"
+      - "src/routes/api/public/agent/heartbeat.ts"
   pull_request:
     branches:
       - main
@@ -29,6 +30,7 @@ on:
       - "src/lib/remote/keys.ts"
       - "src/lib/pairing.ts"
       - "src/routes/api/public/agent/pair.ts"
+      - "src/routes/api/public/agent/heartbeat.ts"
   workflow_dispatch:
 
 permissions:

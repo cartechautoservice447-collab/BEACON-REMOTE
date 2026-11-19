@@ -321,3 +321,65 @@ describe("cross-language TypeScript <-> C# Step 3.3 pairing protocol contract", 
     }
   });
 });
+
+type SharedHeartbeatFixture = {
+  endpointPath: string;
+  method: string;
+  authorizationHeaderPrefix: string;
+  tokenLength: { min: number; max: number };
+  onlineWindowMs: number;
+  recommendedIntervalMs: number;
+  valid200Responses: Array<{ name: string; json: string }>;
+  invalid200Responses: Array<{ name: string; json: string }>;
+  revocation401Response: string;
+  serverError500Response: string;
+};
+
+const HEARTBEAT_FIXTURE_PATH = path.resolve(
+  process.cwd(),
+  "companion/windows/tests/Beacon.Companion.Tests/Fixtures/heartbeat-protocol-contract.json",
+);
+
+const heartbeatFixture: SharedHeartbeatFixture = JSON.parse(
+  readFileSync(HEARTBEAT_FIXTURE_PATH, "utf8"),
+);
+
+function isValidHeartbeat200FromTsContract(rawJson: string): boolean {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawJson);
+  } catch {
+    return false;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+  const obj = parsed as Record<string, unknown>;
+  return (
+    obj["ok"] === true &&
+    typeof obj["server_time"] === "string" &&
+    Number.isFinite(Date.parse(obj["server_time"]))
+  );
+}
+
+describe("cross-language TypeScript <-> C# Step 3.4 heartbeat protocol contract", () => {
+  test("shared heartbeat fixture matches /api/public/agent/heartbeat endpoint and response schema", async () => {
+    const { HEARTBEAT_ONLINE_WINDOW_MS } = await import("@/lib/pairing");
+
+    expect(heartbeatFixture.endpointPath).toBe("/api/public/agent/heartbeat");
+    expect(heartbeatFixture.method).toBe("POST");
+    expect(heartbeatFixture.authorizationHeaderPrefix).toBe("Bearer ");
+    expect(heartbeatFixture.tokenLength).toEqual({ min: 20, max: 128 });
+    expect(heartbeatFixture.onlineWindowMs).toBe(HEARTBEAT_ONLINE_WINDOW_MS);
+    expect(heartbeatFixture.recommendedIntervalMs).toBeLessThan(heartbeatFixture.onlineWindowMs);
+
+    for (const entry of heartbeatFixture.valid200Responses) {
+      expect(isValidHeartbeat200FromTsContract(entry.json), entry.name).toBe(true);
+    }
+
+    for (const entry of heartbeatFixture.invalid200Responses) {
+      expect(isValidHeartbeat200FromTsContract(entry.json), entry.name).toBe(false);
+    }
+
+    expect(JSON.parse(heartbeatFixture.revocation401Response)).toEqual({ error: "unauthorized" });
+    expect(JSON.parse(heartbeatFixture.serverError500Response)).toEqual({ error: "server_error" });
+  });
+});

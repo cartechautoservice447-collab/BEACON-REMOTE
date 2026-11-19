@@ -1,0 +1,49 @@
+{
+  "endpointPath": "/api/public/agent/heartbeat",
+  "method": "POST",
+  "authorizationHeaderPrefix": "Bearer ",
+  "tokenLength": {
+    "min": 20,
+    "max": 128
+  },
+  "onlineWindowMs": 90000,
+  "recommendedIntervalMs": 30000,
+  "valid200Responses": [
+    {
+      "name": "standard-heartbeat-ok",
+      "json": "{\"ok\":true,\"server_time\":\"2026-11-18T12:00:00.000Z\"}"
+    },
+    {
+      "name": "heartbeat-ok-with-offset",
+      "json": "{\"ok\":true,\"server_time\":\"2026-11-18T12:00:00.000+00:00\"}"
+    }
+  ],
+  "invalid200Responses": [
+    {
+      "name": "ok-false",
+      "json": "{\"ok\":false,\"server_time\":\"2026-11-18T12:00:00.000Z\"}"
+    },
+    {
+      "name": "missing-ok",
+      "json": "{\"server_time\":\"2026-11-18T12:00:00.000Z\"}"
+    },
+    {
+      "name": "missing-server-time",
+      "json": "{\"ok\":true}"
+    },
+    {
+      "name": "invalid-server-time",
+      "json": "{\"ok\":true,\"server_time\":\"not-a-timestamp\"}"
+    },
+    {
+      "name": "non-object-array",
+      "json": "[true,\"2026-11-18T12:00:00.000Z\"]"
+    },
+    {
+      "name": "ok-string-instead-of-boolean",
+      "json": "{\"ok\":\"true\",\"server_time\":\"2026-11-18T12:00:00.000Z\"}"
+    }
+  ],
+  "revocation401Response": "{\"error\":\"unauthorized\"}",
+  "serverError500Response": "{\"error\":\"server_error\"}"
+}
