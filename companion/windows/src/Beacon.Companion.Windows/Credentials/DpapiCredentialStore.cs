@@ -505,7 +505,7 @@ public sealed class DpapiCredentialStore : ICredentialStore, IDisposable
         {
             if (!Equals(rule.IdentityReference, currentUserSid) || rule.AccessControlType != AccessControlType.Allow)
             {
-                _ = security.RemoveAccessRuleSpecific(rule);
+                security.RemoveAccessRuleSpecific(rule);
             }
         }
     }
