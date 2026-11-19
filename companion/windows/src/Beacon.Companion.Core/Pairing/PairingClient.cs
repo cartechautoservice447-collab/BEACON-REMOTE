@@ -389,7 +389,10 @@ public sealed class PairingClient : IPairingClient
         };
         requestMessage.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
         requestMessage.Headers.CacheControl = new CacheControlHeaderValue { NoStore = true };
-        requestMessage.Headers.UserAgent.ParseAdd($"BeaconCompanion-Windows/{agentVersion}");
+        if (!requestMessage.Headers.UserAgent.TryParseAdd($"BeaconCompanion-Windows/{agentVersion}"))
+        {
+            requestMessage.Headers.UserAgent.ParseAdd("BeaconCompanion-Windows/0.3.3");
+        }
 
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeoutCts.CancelAfter(_options.RequestTimeout);

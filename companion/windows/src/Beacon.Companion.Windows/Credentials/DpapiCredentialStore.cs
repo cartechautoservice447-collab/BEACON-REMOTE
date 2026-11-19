@@ -455,42 +455,59 @@ public sealed class DpapiCredentialStore : ICredentialStore, IDisposable
     private static void EnsureUserRestrictedDirectory(string directoryPath)
     {
         var currentUserSid = GetCurrentUserSid();
+        var dirInfo = Directory.CreateDirectory(directoryPath);
         var directorySecurity = new DirectorySecurity();
 
-        // Disable inheritance and remove inherited rules so only the current user SID has explicit access.
-        directorySecurity.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+        // Add the current-user rule BEFORE SetAccessRuleProtection so CommonSecurityDescriptor
+        // clears its internal EveryOneFullAccessForNullDacl (WorldSid / Everyone) placeholder ACE,
+        // then disable inheritance and purge any non-current-user rules.
         directorySecurity.AddAccessRule(new FileSystemAccessRule(
             currentUserSid,
             FileSystemRights.FullControl,
             InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit,
             PropagationFlags.None,
             AccessControlType.Allow));
+        directorySecurity.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+        RemoveNonCurrentUserRules(directorySecurity, currentUserSid);
 
-        var dirInfo = new DirectoryInfo(directoryPath);
-        if (!dirInfo.Exists)
-        {
-            FileSystemAclExtensions.CreateDirectory(directorySecurity, directoryPath);
-        }
-        else
-        {
-            FileSystemAclExtensions.SetAccessControl(dirInfo, directorySecurity);
-        }
+        FileSystemAclExtensions.SetAccessControl(dirInfo, directorySecurity);
     }
 
     private static void ApplyUserRestrictedFileAcl(string filePath)
     {
         var currentUserSid = GetCurrentUserSid();
         var fileSecurity = new FileSecurity();
-        fileSecurity.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+
+        // Add the current-user rule BEFORE SetAccessRuleProtection so CommonSecurityDescriptor
+        // clears its internal EveryOneFullAccessForNullDacl (WorldSid / Everyone) placeholder ACE,
+        // then disable inheritance and purge any non-current-user rules.
         fileSecurity.AddAccessRule(new FileSystemAccessRule(
             currentUserSid,
             FileSystemRights.FullControl,
             InheritanceFlags.None,
             PropagationFlags.None,
             AccessControlType.Allow));
+        fileSecurity.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+        RemoveNonCurrentUserRules(fileSecurity, currentUserSid);
 
         var fileInfo = new FileInfo(filePath);
         FileSystemAclExtensions.SetAccessControl(fileInfo, fileSecurity);
+    }
+
+    private static void RemoveNonCurrentUserRules(FileSystemSecurity security, SecurityIdentifier currentUserSid)
+    {
+        var rules = security
+            .GetAccessRules(includeExplicit: true, includeInherited: true, typeof(SecurityIdentifier))
+            .Cast<FileSystemAccessRule>()
+            .ToArray();
+
+        foreach (var rule in rules)
+        {
+            if (!Equals(rule.IdentityReference, currentUserSid) || rule.AccessControlType != AccessControlType.Allow)
+            {
+                _ = security.RemoveAccessRuleSpecific(rule);
+            }
+        }
     }
 
     private static SecurityIdentifier GetCurrentUserSid()
@@ -514,11 +531,12 @@ public sealed class DpapiCredentialStore : ICredentialStore, IDisposable
             FileOptions.WriteThrough | FileOptions.Asynchronous);
         await using (stream.ConfigureAwait(false))
         {
-            ApplyUserRestrictedFileAcl(path);
             await stream.WriteAsync(content.AsMemory(), ct).ConfigureAwait(false);
             await stream.FlushAsync(ct).ConfigureAwait(false);
             stream.Flush(flushToDisk: true);
         }
+
+        ApplyUserRestrictedFileAcl(path);
     }
 
     /// <summary>

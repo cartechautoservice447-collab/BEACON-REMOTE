@@ -72,9 +72,21 @@ public sealed class DpapiCredentialStoreTests : IDisposable
         Assert.Equal(-1, rawDiskBytes.AsSpan().IndexOf(Encoding.UTF8.GetBytes(secretToken)));
         Assert.Equal(-1, rawDiskBytes.AsSpan().IndexOf(Encoding.Unicode.GetBytes(secretToken)));
 
-        // Verify restrictive current-user SID ACL on both directory and file.
+        // Verify restrictive current-user SID ACL on both directory and file (and confirm Everyone/WorldSid is absent).
         using var currentIdentity = WindowsIdentity.GetCurrent();
         var currentUserSid = currentIdentity.User!;
+        var worldSid = new SecurityIdentifier(WellKnownSidType.WorldSid, null);
+
+        var dirSecurity = FileSystemAclExtensions.GetAccessControl(new DirectoryInfo(_testRootDir));
+        Assert.True(dirSecurity.AreAccessRulesProtected);
+        var dirRules = dirSecurity.GetAccessRules(includeExplicit: true, includeInherited: true, typeof(SecurityIdentifier))
+            .Cast<FileSystemAccessRule>()
+            .ToArray();
+        var dirRule = Assert.Single(dirRules);
+        Assert.Equal(currentUserSid, dirRule.IdentityReference);
+        Assert.NotEqual(worldSid, dirRule.IdentityReference);
+        Assert.Equal(AccessControlType.Allow, dirRule.AccessControlType);
+
         var fileSecurity = FileSystemAclExtensions.GetAccessControl(new FileInfo(credPath));
         Assert.True(fileSecurity.AreAccessRulesProtected);
         var rules = fileSecurity.GetAccessRules(includeExplicit: true, includeInherited: true, typeof(SecurityIdentifier))
@@ -82,6 +94,7 @@ public sealed class DpapiCredentialStoreTests : IDisposable
             .ToArray();
         var rule = Assert.Single(rules);
         Assert.Equal(currentUserSid, rule.IdentityReference);
+        Assert.NotEqual(worldSid, rule.IdentityReference);
         Assert.Equal(AccessControlType.Allow, rule.AccessControlType);
 
         using var loaded = await store.LoadAsync();
@@ -210,6 +223,10 @@ public sealed class DpapiCredentialStoreTests : IDisposable
             }
         }
         catch (IOException)
+        {
+            // Ignore best-effort test directory cleanup errors.
+        }
+        catch (UnauthorizedAccessException)
         {
             // Ignore best-effort test directory cleanup errors.
         }

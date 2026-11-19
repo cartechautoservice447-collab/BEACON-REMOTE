@@ -77,7 +77,8 @@ public static class ServerOriginValidator
         }
 
         var trimmed = rawOrigin.Trim();
-        if (!Uri.TryCreate(trimmed, UriKind.Absolute, out var uri))
+        if (!trimmed.Contains("://", StringComparison.Ordinal) ||
+            !Uri.TryCreate(trimmed, UriKind.Absolute, out var uri))
         {
             return ServerOriginValidationResult.Invalid(
                 ServerOriginValidationError.NotAbsoluteUri,
