@@ -4,6 +4,7 @@
     <TargetFramework>$(BeaconWindowsTargetFramework)</TargetFramework>
     <RootNamespace>Beacon.Companion.Windows</RootNamespace>
     <AssemblyName>Beacon.Companion.Windows</AssemblyName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
   <ItemGroup>
