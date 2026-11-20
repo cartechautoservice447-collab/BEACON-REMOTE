@@ -136,6 +136,23 @@ jobs:
             }
           }
 
+      - name: Package DXGI smoke harness for signing
+        shell: pwsh
+        run: |
+          $outDir = "${{ github.workspace }}\DxgiSmokePackage"
+          New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+          $binDir = "${{ github.workspace }}\companion\windows\src\Beacon.Companion.DxgiSmokeTest\bin\Release\net10.0-windows10.0.22621.0"
+          Copy-Item -Path (Join-Path $binDir "Beacon.Companion.DxgiSmokeTest.exe") -Destination $outDir
+          Copy-Item -Path (Join-Path $binDir "Beacon.Companion.Core.dll") -Destination $outDir
+          Copy-Item -Path (Join-Path $binDir "Beacon.Companion.Windows.dll") -Destination $outDir
+          Compress-Archive -Path (Join-Path $outDir "*") -DestinationPath "${{ github.workspace }}\DxgiSmokeTest-unsigned.zip" -Force
+
+      - name: Upload unsigned DXGI smoke harness bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: dxgi-smoke-harness-unsigned
+          path: DxgiSmokeTest-unsigned.zip
+          retention-days: 14
       - name: Upload TRX test report artifact
         if: always()
         uses: actions/upload-artifact@v4
