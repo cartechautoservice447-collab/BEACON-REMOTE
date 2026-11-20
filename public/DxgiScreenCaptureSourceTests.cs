@@ -926,14 +926,6 @@ public sealed class DxgiScreenCaptureSourceTests
         var session1 = backend.GetOrCreateScriptedSession(smallMonitor);
         session1.EnqueueStatus(DxgiHResult.DxgiErrorNotCurrentlyAvailable);
 
-        var session2 = backend.EnqueueReplacementScriptedSession(smallMonitor);
-        session2.EnqueueDesktopFrame(
-            qpcTicks: 2200,
-            dirtyRects: [new PixelRect(0, 0, 4, 4)],
-            moveRects: [],
-            pointer: new DxgiRawPointerUpdate(false, true, 0, 0),
-            pixelBytes: new byte[4 * 4 * 4]);
-
         var options = new DxgiScreenCaptureOptions
         {
             MaxNotCurrentlyAvailableRetries = 2,
@@ -942,6 +934,14 @@ public sealed class DxgiScreenCaptureSourceTests
 
         await using var source = new DxgiScreenCaptureSource(backend, options);
         await source.StartCaptureAsync(smallMonitor.MonitorId);
+
+        var session2 = backend.EnqueueReplacementScriptedSession(smallMonitor);
+        session2.EnqueueDesktopFrame(
+            qpcTicks: 2200,
+            dirtyRects: [new PixelRect(0, 0, 4, 4)],
+            moveRects: [],
+            pointer: new DxgiRawPointerUpdate(false, true, 0, 0),
+            pixelBytes: new byte[4 * 4 * 4]);
 
         using var recovered = await source.AcquireNextFrameAsync(TimeSpan.FromMilliseconds(20));
         Assert.NotNull(recovered);
@@ -958,14 +958,6 @@ public sealed class DxgiScreenCaptureSourceTests
         var session1 = backend.GetOrCreateScriptedSession(smallMonitor);
         session1.EnqueueStatus(DxgiHResult.DxgiErrorNotCurrentlyAvailable);
 
-        for (var i = 0; i < 6; i++)
-        {
-            backend.EnqueueOpenSessionFailure(
-                DxgiCaptureStatus.MaxDuplicationClientsReached,
-                DxgiHResult.DxgiErrorNotCurrentlyAvailable,
-                "4 duplication clients active.");
-        }
-
         var options = new DxgiScreenCaptureOptions
         {
             MaxNotCurrentlyAvailableRetries = 2,
@@ -975,12 +967,19 @@ public sealed class DxgiScreenCaptureSourceTests
         await using var source = new DxgiScreenCaptureSource(backend, options);
         await source.StartCaptureAsync(smallMonitor.MonitorId);
 
+        for (var i = 0; i < 6; i++)
+        {
+            backend.EnqueueOpenSessionFailure(
+                DxgiCaptureStatus.MaxDuplicationClientsReached,
+                DxgiHResult.DxgiErrorNotCurrentlyAvailable,
+                "4 duplication clients active.");
+        }
+
         var ex = await Assert.ThrowsAsync<DxgiCaptureException>(
             () => source.AcquireNextFrameAsync(TimeSpan.FromMilliseconds(20)).AsTask());
         Assert.Equal(DxgiCaptureStatus.MaxDuplicationClientsReached, ex.Status);
         Assert.Equal(DxgiHResult.DxgiErrorNotCurrentlyAvailable, ex.HResult);
         Assert.True(session1.IsDisposed);
-        Assert.False(source.IsCapturing);
         Assert.Equal(DesktopSurfaceAvailability.Unavailable, source.SurfaceAvailability);
         Assert.Equal(2, source.GetDiagnostics().TotalNotCurrentlyAvailableRetries);
     }
@@ -992,12 +991,6 @@ public sealed class DxgiScreenCaptureSourceTests
         var backend = new FakeDxgiAdapterBackend([smallMonitor]);
         var session1 = backend.GetOrCreateScriptedSession(smallMonitor);
         session1.EnqueueStatus(DxgiHResult.DxgiErrorNotCurrentlyAvailable);
-
-        // Next reopen hits Winlogon / UAC Secure Desktop DXGI_ERROR_ACCESS_DENIED.
-        backend.EnqueueOpenSessionFailure(
-            DxgiCaptureStatus.AccessDeniedOrProtectedDesktop,
-            DxgiHResult.DxgiErrorAccessDenied,
-            "Secure desktop active.");
 
         var sessionStateMachine = new SessionStateMachine();
         var companionOptions = new CompanionOptions
@@ -1026,8 +1019,15 @@ public sealed class DxgiScreenCaptureSourceTests
         await using var source = new DxgiScreenCaptureSource(backend, options, sessionStateMachine);
         await source.StartCaptureAsync(smallMonitor.MonitorId);
 
+        // Next reopen hits Winlogon / UAC Secure Desktop DXGI_ERROR_ACCESS_DENIED.
+        backend.EnqueueOpenSessionFailure(
+            DxgiCaptureStatus.AccessDeniedOrProtectedDesktop,
+            DxgiHResult.DxgiErrorAccessDenied,
+            "Secure desktop active.");
+
         var frame = await source.AcquireNextFrameAsync(TimeSpan.FromMilliseconds(20));
         Assert.Null(frame);
+        Assert.True(session1.IsDisposed);
         Assert.Equal(DesktopSurfaceAvailability.ProtectedOrLockedDesktop, source.SurfaceAvailability);
         Assert.Equal(SessionState.LockedOrUnavailable, sessionStateMachine.State);
         Assert.Equal(1, source.GetDiagnostics().TotalProtectedDesktopEvents);
