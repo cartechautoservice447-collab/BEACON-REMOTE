@@ -32,6 +32,13 @@ internal static unsafe class NativeDxgiInterop
     public const uint MonitorDefaultToNearest = 2;
     public const int MdtEffectiveDpi = 0;
 
+    public const uint DesktopReadObjects = 0x0001;
+    public static readonly nint DpiAwarenessContextPerMonitorAwareV2 = new(-4);
+    public const uint SrcCopy = 0x00CC0020;
+    public const uint CaptureBlt = 0x40000000;
+    public const uint DibRgbColors = 0;
+    public const uint BiRgb = 0;
+
     public static readonly Guid IidIdxgiFactory1 = new("770aae78-f26f-4dba-a829-253c83d1b387");
     public static readonly Guid IidIdxgiOutput1 = new("00cddea8-939b-4b83-a340-a685226666cc");
     public static readonly Guid IidId3d11Texture2D = new("6f15aaf2-d208-4e89-9ab4-489535d34f9c");
@@ -218,6 +225,29 @@ internal static unsafe class NativeDxgiInterop
         public uint DmPanningHeight;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    public struct BitmapInfoHeader
+    {
+        public uint BiSize;
+        public int BiWidth;
+        public int BiHeight;
+        public ushort BiPlanes;
+        public ushort BiBitCount;
+        public uint BiCompression;
+        public uint BiSizeImage;
+        public int BiXPelsPerMeter;
+        public int BiYPelsPerMeter;
+        public uint BiClrUsed;
+        public uint BiClrImportant;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct BitmapInfo
+    {
+        public BitmapInfoHeader BmiHeader;
+        public uint BmiColor0;
+    }
+
     [DllImport("dxgi.dll", ExactSpelling = true)]
     public static extern int CreateDXGIFactory1(in Guid riid, out nint ppFactory);
 
@@ -260,6 +290,61 @@ internal static unsafe class NativeDxgiInterop
         int dpiType,
         out uint dpiX,
         out uint dpiY);
+
+    [DllImport("user32.dll", ExactSpelling = true, SetLastError = true)]
+    public static extern nint OpenInputDesktop(
+        uint dwFlags,
+        [MarshalAs(UnmanagedType.Bool)] bool fInherit,
+        uint dwDesiredAccess);
+
+    [DllImport("user32.dll", ExactSpelling = true, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool CloseDesktop(nint hDesktop);
+
+    [DllImport("user32.dll", ExactSpelling = true)]
+    public static extern nint GetDC(nint hWnd);
+
+    [DllImport("user32.dll", ExactSpelling = true)]
+    public static extern int ReleaseDC(nint hWnd, nint hDc);
+
+    [DllImport("user32.dll", ExactSpelling = true)]
+    public static extern nint SetThreadDpiAwarenessContext(nint dpiContext);
+
+    [DllImport("gdi32.dll", ExactSpelling = true)]
+    public static extern nint CreateCompatibleDC(nint hdc);
+
+    [DllImport("gdi32.dll", ExactSpelling = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool DeleteDC(nint hdc);
+
+    [DllImport("gdi32.dll", ExactSpelling = true)]
+    public static extern nint CreateDIBSection(
+        nint hdc,
+        in BitmapInfo pbmi,
+        uint usage,
+        out nint ppvBits,
+        nint hSection,
+        uint offset);
+
+    [DllImport("gdi32.dll", ExactSpelling = true)]
+    public static extern nint SelectObject(nint hdc, nint h);
+
+    [DllImport("gdi32.dll", ExactSpelling = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool DeleteObject(nint ho);
+
+    [DllImport("gdi32.dll", ExactSpelling = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool BitBlt(
+        nint hdc,
+        int x,
+        int y,
+        int cx,
+        int cy,
+        nint hdcSrc,
+        int x1,
+        int y1,
+        uint rop);
 
     public static long GetQpcTicks() => Stopwatch.GetTimestamp();
 

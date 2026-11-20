@@ -65,6 +65,9 @@ jobs:
       - name: Build Core and Tests (Release)
         run: dotnet build "${{ env.TEST_PROJECT }}" --configuration Release --no-restore
 
+      - name: Build Physical DXGI Smoke Harness (Release)
+        run: dotnet build "companion/windows/src/Beacon.Companion.DxgiSmokeTest/Beacon.Companion.DxgiSmokeTest.csproj" --configuration Release
+
       - name: Prepare test results directory
         shell: pwsh
         run: New-Item -ItemType Directory -Force -Path "${{ github.workspace }}/TestResults" | Out-Null

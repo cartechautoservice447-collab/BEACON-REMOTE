@@ -101,6 +101,13 @@ public static class DxgiHResultClassifier
         status is DxgiCaptureStatus.AccessLost
             or DxgiCaptureStatus.DeviceRemovedOrReset
             or DxgiCaptureStatus.InvalidCall;
+
+    /// <summary>
+    /// Returns true for contention/transition statuses (such as <c>DXGI_ERROR_NOT_CURRENTLY_AVAILABLE</c>)
+    /// that merit a strictly bounded delayed retry before failing closed.
+    /// </summary>
+    public static bool IsBoundedAvailabilityRetry(DxgiCaptureStatus status) =>
+        status is DxgiCaptureStatus.MaxDuplicationClientsReached;
 }
 
 /// <summary>
@@ -162,7 +169,8 @@ public sealed record DxgiAcquiredFrameData(
     ReadOnlyMemory<DxgiMoveRect> MoveRects,
     DxgiRawPointerUpdate PointerUpdate,
     Func<Memory<byte>, int, CancellationToken, ValueTask>? CopyPixelsDelegate = null,
-    FrameBackingKind BackingKind = FrameBackingKind.GpuTexture);
+    FrameBackingKind BackingKind = FrameBackingKind.GpuTexture,
+    bool RectsInUnrotatedSpace = false);
 
 /// <summary>
 /// Outcome of a single <see cref="IDxgiDuplicationSession.TryAcquireNextFrame"/> call.
@@ -273,6 +281,18 @@ public sealed record DxgiScreenCaptureOptions
     public TimeSpan MaxAcquireTimeout { get; init; } = TimeSpan.FromSeconds(5);
 
     /// <summary>
+    /// Bounded retry count when DXGI reports <c>DXGI_ERROR_NOT_CURRENTLY_AVAILABLE</c> (<c>0x887A0022</c>),
+    /// which can happen transiently during DWM desktop transitions or duplication client teardown before
+    /// indicating persistent 4-client quota exhaustion.
+    /// </summary>
+    public int MaxNotCurrentlyAvailableRetries { get; init; } = 3;
+
+    /// <summary>
+    /// Bounded non-busy delay between <c>DXGI_ERROR_NOT_CURRENTLY_AVAILABLE</c> recovery retries.
+    /// </summary>
+    public TimeSpan NotCurrentlyAvailableRetryDelay { get; init; } = TimeSpan.FromMilliseconds(75);
+
+    /// <summary>
     /// When false (default), cursor-only updates without desktop pixel changes update <c>LatestCursor</c>
     /// and <c>LatestCursorShape</c> and immediately release the DXGI frame without emitting a duplicate video frame.
     /// When true, cursor-only updates emit a frame if a valid desktop surface is present.
@@ -285,9 +305,12 @@ public sealed record DxgiScreenCaptureOptions
         ArgumentOutOfRangeException.ThrowIfGreaterThan(MaxPooledFrames, 16);
         ArgumentOutOfRangeException.ThrowIfLessThan(MaxConsecutiveRecoveryAttempts, 1);
         ArgumentOutOfRangeException.ThrowIfGreaterThan(MaxConsecutiveRecoveryAttempts, 16);
+        ArgumentOutOfRangeException.ThrowIfLessThan(MaxNotCurrentlyAvailableRetries, 0);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(MaxNotCurrentlyAvailableRetries, 16);
         ArgumentOutOfRangeException.ThrowIfLessThan(AccessLostRetryDelay, TimeSpan.Zero);
         ArgumentOutOfRangeException.ThrowIfLessThan(DeviceResetRetryDelay, TimeSpan.Zero);
         ArgumentOutOfRangeException.ThrowIfLessThan(ProtectedDesktopBackoffDelay, TimeSpan.Zero);
+        ArgumentOutOfRangeException.ThrowIfLessThan(NotCurrentlyAvailableRetryDelay, TimeSpan.Zero);
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(MaxAcquireTimeout, TimeSpan.Zero);
     }
 }
@@ -308,7 +331,8 @@ public sealed record DxgiCaptureDiagnostics(
     int TotalPooledSlots,
     DesktopSurfaceAvailability SurfaceAvailability,
     DxgiCaptureStatus LastStatus,
-    int LastHResult);
+    int LastHResult,
+    long TotalNotCurrentlyAvailableRetries = 0);
 
 /// <summary>
 /// Exception thrown when DXGI Desktop Duplication encounters a non-recoverable or unsupported error.

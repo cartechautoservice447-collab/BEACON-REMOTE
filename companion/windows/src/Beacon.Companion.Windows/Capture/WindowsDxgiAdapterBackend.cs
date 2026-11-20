@@ -268,19 +268,21 @@ public sealed unsafe class WindowsDxgiAdapterBackend : IDxgiAdapterBackend
             }
 
             NativeDxgiInterop.DuplicationGetDesc(duplication, out var dupDesc);
-            var surfaceWidth = dupDesc.ModeDesc.Width > 0
-                ? (int)dupDesc.ModeDesc.Width
-                : monitor.PhysicalSize.Width;
-            var surfaceHeight = dupDesc.ModeDesc.Height > 0
-                ? (int)dupDesc.ModeDesc.Height
-                : monitor.PhysicalSize.Height;
-            var surfaceSize = new PixelSize(Math.Max(1, surfaceWidth), Math.Max(1, surfaceHeight));
-            var pixelFormat = NativeDxgiInterop.MapDxgiFormat(dupDesc.ModeDesc.Format);
             var rotation = NativeDxgiInterop.MapDxgiRotation(dupDesc.Rotation);
+            var fallbackRawSize = DxgiGeometryNormalizer.GetUnrotatedSize(monitor.PhysicalSize, rotation);
+            var rawWidth = dupDesc.ModeDesc.Width > 0
+                ? (int)dupDesc.ModeDesc.Width
+                : fallbackRawSize.Width;
+            var rawHeight = dupDesc.ModeDesc.Height > 0
+                ? (int)dupDesc.ModeDesc.Height
+                : fallbackRawSize.Height;
+            var rawSurfaceSize = new PixelSize(Math.Max(1, rawWidth), Math.Max(1, rawHeight));
+            var orientedSurfaceSize = DxgiGeometryNormalizer.GetOrientedSize(rawSurfaceSize, rotation);
+            var pixelFormat = NativeDxgiInterop.MapDxgiFormat(dupDesc.ModeDesc.Format);
 
             var session = new WindowsDxgiDuplicationSession(
                 monitor,
-                surfaceSize,
+                orientedSurfaceSize,
                 pixelFormat,
                 rotation,
                 d3d11Device,
@@ -444,6 +446,7 @@ public sealed unsafe class WindowsDxgiAdapterBackend : IDxgiAdapterBackend
         private nint _acquiredResource;
         private int _isFrameAcquired;
         private int _disposed;
+        private bool _hasEmittedInitialDesktopFrame;
 
         private byte[] _dirtyMetadataScratch = new byte[256];
         private byte[] _moveMetadataScratch = new byte[256];
@@ -492,6 +495,16 @@ public sealed unsafe class WindowsDxgiAdapterBackend : IDxgiAdapterBackend
 
             if (hr == DxgiHResult.DxgiErrorWaitTimeout)
             {
+                if (!_hasEmittedInitialDesktopFrame && timeoutMilliseconds > 0)
+                {
+                    var fallback = TryCaptureInitialIdleDesktopFrame();
+                    if (fallback is not null)
+                    {
+                        _hasEmittedInitialDesktopFrame = true;
+                        return fallback;
+                    }
+                }
+
                 return DxgiAcquireAttemptResult.WaitTimeout();
             }
 
@@ -506,7 +519,13 @@ public sealed unsafe class WindowsDxgiAdapterBackend : IDxgiAdapterBackend
             _acquiredResource = desktopResource;
             Volatile.Write(ref _isFrameAcquired, 1);
 
-            var hasDesktopUpdate = frameInfo.LastPresentTime > 0 || frameInfo.TotalMetadataBufferSize > 0;
+            var isInitialSurfaceCapture = !_hasEmittedInitialDesktopFrame;
+            var hasDesktopUpdate = isInitialSurfaceCapture ||
+                                   frameInfo.LastPresentTime > 0 ||
+                                   frameInfo.TotalMetadataBufferSize > 0 ||
+                                   frameInfo.AccumulatedFrames > 0;
+            _hasEmittedInitialDesktopFrame = true;
+
             var dirtyRects = ReadOnlyMemory<PixelRect>.Empty;
             var moveRects = ReadOnlyMemory<DxgiMoveRect>.Empty;
 
@@ -530,7 +549,8 @@ public sealed unsafe class WindowsDxgiAdapterBackend : IDxgiAdapterBackend
                 MoveRects: moveRects,
                 PointerUpdate: pointerUpdate,
                 CopyPixelsDelegate: null,
-                BackingKind: FrameBackingKind.GpuTexture);
+                BackingKind: FrameBackingKind.GpuTexture,
+                RectsInUnrotatedSpace: SurfaceRotation != DisplayRotation.Identity);
 
             return DxgiAcquireAttemptResult.Success(frameData);
         }
@@ -540,6 +560,12 @@ public sealed unsafe class WindowsDxgiAdapterBackend : IDxgiAdapterBackend
             ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
             ArgumentNullException.ThrowIfNull(frameData);
             ArgumentNullException.ThrowIfNull(slot);
+
+            if (frameData.CopyPixelsDelegate is not null)
+            {
+                slot.BindCopyDelegate(frameData.CopyPixelsDelegate, frameData.BackingKind);
+                return;
+            }
 
             if (_acquiredResource == 0)
             {
@@ -562,7 +588,7 @@ public sealed unsafe class WindowsDxgiAdapterBackend : IDxgiAdapterBackend
             try
             {
                 NativeDxgiInterop.Texture2DGetDesc(desktopTexture, out var texDesc);
-                EnsureStagingTexture(in texDesc);
+                EnsureStagingTexture(in texDesc, slot);
 
                 NativeDxgiInterop.ContextCopyResource(_immediateContext, _stagingTexture, desktopTexture);
 
@@ -584,17 +610,21 @@ public sealed unsafe class WindowsDxgiAdapterBackend : IDxgiAdapterBackend
                 try
                 {
                     var dstSpan = slot.GetOrAllocateStagingBuffer(FrameBackingKind.GpuTexture);
-                    var rowBytes = slot.TightRowPitchBytes;
-                    var rows = Math.Min(slot.Size.Height, (int)texDesc.Height);
-                    var srcBase = (byte*)mapped.PData;
+                    var srcWidth = (int)texDesc.Width;
+                    var srcHeight = (int)texDesc.Height;
                     var srcRowPitch = (int)mapped.RowPitch;
+                    var srcRequiredBytes = checked((srcHeight - 1) * srcRowPitch + srcWidth * slot.BytesPerPixel);
+                    var srcSpan = new ReadOnlySpan<byte>((void*)mapped.PData, srcRequiredBytes);
 
-                    for (var y = 0; y < rows; y++)
-                    {
-                        var srcRow = new ReadOnlySpan<byte>(srcBase + (nint)y * srcRowPitch, rowBytes);
-                        var dstRow = dstSpan.Slice(y * rowBytes, rowBytes);
-                        srcRow.CopyTo(dstRow);
-                    }
+                    DxgiGeometryNormalizer.RotatePixels(
+                        source: srcSpan,
+                        sourceWidth: srcWidth,
+                        sourceHeight: srcHeight,
+                        sourceRowPitchBytes: srcRowPitch,
+                        destination: dstSpan,
+                        destinationRowPitchBytes: slot.TightRowPitchBytes,
+                        bytesPerPixel: slot.BytesPerPixel,
+                        rotation: SurfaceRotation);
                 }
                 finally
                 {
@@ -631,8 +661,170 @@ public sealed unsafe class WindowsDxgiAdapterBackend : IDxgiAdapterBackend
             _ = NativeDxgiInterop.ReleaseComObject(ref _d3d11Device);
         }
 
-        private void EnsureStagingTexture(in NativeDxgiInterop.D3d11Texture2dDesc srcDesc)
+        private DxgiAcquireAttemptResult? TryCaptureInitialIdleDesktopFrame()
         {
+            // Strict fail-closed desktop isolation check: never attempt capture when the input desktop
+            // is locked, switched to Winlogon/UAC Secure Desktop, or running outside an interactive desktop.
+            var inputDesktop = NativeDxgiInterop.OpenInputDesktop(0, false, NativeDxgiInterop.DesktopReadObjects);
+            if (inputDesktop == 0)
+            {
+                return null;
+            }
+
+            _ = NativeDxgiInterop.CloseDesktop(inputDesktop);
+
+            var width = SurfaceSize.Width;
+            var height = SurfaceSize.Height;
+            if (width <= 0 || height <= 0)
+            {
+                return null;
+            }
+
+            var prevDpiCtx = NativeDxgiInterop.SetThreadDpiAwarenessContext(
+                NativeDxgiInterop.DpiAwarenessContextPerMonitorAwareV2);
+            nint screenDc = 0;
+            nint memDc = 0;
+            nint dibBitmap = 0;
+            nint prevBitmap = 0;
+
+            try
+            {
+                screenDc = NativeDxgiInterop.GetDC(0);
+                if (screenDc == 0)
+                {
+                    return null;
+                }
+
+                memDc = NativeDxgiInterop.CreateCompatibleDC(screenDc);
+                if (memDc == 0)
+                {
+                    return null;
+                }
+
+                var bmi = new NativeDxgiInterop.BitmapInfo
+                {
+                    BmiHeader = new NativeDxgiInterop.BitmapInfoHeader
+                    {
+                        BiSize = (uint)sizeof(NativeDxgiInterop.BitmapInfoHeader),
+                        BiWidth = width,
+                        BiHeight = -height, // Top-down BGRA DIB matching DXGI row order
+                        BiPlanes = 1,
+                        BiBitCount = 32,
+                        BiCompression = NativeDxgiInterop.BiRgb,
+                    },
+                };
+
+                dibBitmap = NativeDxgiInterop.CreateDIBSection(
+                    memDc,
+                    in bmi,
+                    NativeDxgiInterop.DibRgbColors,
+                    out var dibBits,
+                    0,
+                    0);
+                if (dibBitmap == 0 || dibBits == 0)
+                {
+                    return null;
+                }
+
+                prevBitmap = NativeDxgiInterop.SelectObject(memDc, dibBitmap);
+                var bltOk = NativeDxgiInterop.BitBlt(
+                    memDc,
+                    0,
+                    0,
+                    width,
+                    height,
+                    screenDc,
+                    Monitor.DesktopBounds.Left,
+                    Monitor.DesktopBounds.Top,
+                    NativeDxgiInterop.SrcCopy | NativeDxgiInterop.CaptureBlt);
+                if (!bltOk)
+                {
+                    return null;
+                }
+
+                var totalBytes = checked(width * height * 4);
+                var snapshot = new byte[totalBytes];
+                new ReadOnlySpan<byte>((void*)dibBits, totalBytes).CopyTo(snapshot);
+                var tightRowBytes = checked(width * 4);
+
+                var frameData = new DxgiAcquiredFrameData(
+                    PresentTimestampQpcTicks: NativeDxgiInterop.GetQpcTicks(),
+                    HasDesktopImageUpdate: true,
+                    SurfaceSize: SurfaceSize,
+                    PixelFormat: FramePixelFormat.Bgra8Unorm,
+                    SurfaceRotation: SurfaceRotation,
+                    DirtyRects: new[] { new PixelRect(0, 0, width, height) },
+                    MoveRects: ReadOnlyMemory<DxgiMoveRect>.Empty,
+                    PointerUpdate: new DxgiRawPointerUpdate(false, true, 0, 0),
+                    CopyPixelsDelegate: (destination, strideBytes, ct) =>
+                    {
+                        ct.ThrowIfCancellationRequested();
+                        var dstSpan = destination.Span;
+                        var srcSpan = snapshot.AsSpan();
+                        if (strideBytes == tightRowBytes)
+                        {
+                            srcSpan.CopyTo(dstSpan[..totalBytes]);
+                        }
+                        else
+                        {
+                            for (var row = 0; row < height; row++)
+                            {
+                                srcSpan.Slice(row * tightRowBytes, tightRowBytes)
+                                    .CopyTo(dstSpan.Slice(row * strideBytes, tightRowBytes));
+                            }
+                        }
+
+                        return ValueTask.CompletedTask;
+                    },
+                    BackingKind: FrameBackingKind.CpuStaging,
+                    RectsInUnrotatedSpace: false);
+
+                return DxgiAcquireAttemptResult.Success(frameData);
+            }
+            finally
+            {
+                if (prevBitmap != 0 && memDc != 0)
+                {
+                    _ = NativeDxgiInterop.SelectObject(memDc, prevBitmap);
+                }
+
+                if (dibBitmap != 0)
+                {
+                    _ = NativeDxgiInterop.DeleteObject(dibBitmap);
+                }
+
+                if (memDc != 0)
+                {
+                    _ = NativeDxgiInterop.DeleteDC(memDc);
+                }
+
+                if (screenDc != 0)
+                {
+                    _ = NativeDxgiInterop.ReleaseDC(0, screenDc);
+                }
+
+                if (prevDpiCtx != 0)
+                {
+                    _ = NativeDxgiInterop.SetThreadDpiAwarenessContext(prevDpiCtx);
+                }
+            }
+        }
+
+        private void EnsureStagingTexture(in NativeDxgiInterop.D3d11Texture2dDesc srcDesc, DxgiPooledFrameSlot slot)
+        {
+            var rawTexSize = new PixelSize((int)srcDesc.Width, (int)srcDesc.Height);
+            var orientedTexSize = DxgiGeometryNormalizer.GetOrientedSize(rawTexSize, SurfaceRotation);
+            var texFormat = NativeDxgiInterop.MapDxgiFormat(srcDesc.Format);
+            if (orientedTexSize != slot.Size || texFormat != slot.PixelFormat)
+            {
+                SurfaceSize = orientedTexSize;
+                PixelFormat = texFormat;
+                throw new DxgiCaptureException(
+                    DxgiCaptureStatus.AccessLost,
+                    DxgiHResult.DxgiErrorAccessLost,
+                    $"Acquired desktop texture geometry ({orientedTexSize.Width}x{orientedTexSize.Height} {texFormat}) no longer matches active pool ({slot.Size.Width}x{slot.Size.Height} {slot.PixelFormat}).");
+            }
+
             if (_stagingTexture != 0 &&
                 _stagingWidth == srcDesc.Width &&
                 _stagingHeight == srcDesc.Height &&
@@ -669,8 +861,8 @@ public sealed unsafe class WindowsDxgiAdapterBackend : IDxgiAdapterBackend
             _stagingWidth = srcDesc.Width;
             _stagingHeight = srcDesc.Height;
             _stagingFormat = srcDesc.Format;
-            SurfaceSize = new PixelSize((int)srcDesc.Width, (int)srcDesc.Height);
-            PixelFormat = NativeDxgiInterop.MapDxgiFormat(srcDesc.Format);
+            SurfaceSize = orientedTexSize;
+            PixelFormat = texFormat;
         }
 
         private ReadOnlyMemory<PixelRect> ReadDirtyRects(uint metadataBytesHint)

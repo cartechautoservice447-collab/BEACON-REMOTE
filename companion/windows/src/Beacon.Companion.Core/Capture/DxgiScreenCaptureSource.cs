@@ -27,6 +27,7 @@ public sealed class DxgiScreenCaptureSource : IScreenCaptureSource, IDisposable
     private string? _requestedMonitorKey;
     private bool _isCapturing;
     private bool _wasLockedOrProtected;
+    private bool _hasPublishedInitialFrameInEpoch;
 
     private long _captureEpoch;
     private long _frameSequence;
@@ -42,6 +43,7 @@ public sealed class DxgiScreenCaptureSource : IScreenCaptureSource, IDisposable
     private long _totalDeviceResetRecoveries;
     private long _totalProtectedDesktopEvents;
     private long _totalPoolExhaustedDrops;
+    private long _totalNotCurrentlyAvailableRetries;
     private DesktopSurfaceAvailability _surfaceAvailability = DesktopSurfaceAvailability.Unavailable;
     private DxgiCaptureStatus _lastStatus = DxgiCaptureStatus.Ok;
     private int _lastHResult = DxgiHResult.SOk;
@@ -140,7 +142,8 @@ public sealed class DxgiScreenCaptureSource : IScreenCaptureSource, IDisposable
                 TotalPooledSlots: pool?.TotalAllocatedSlots ?? 0,
                 SurfaceAvailability: _surfaceAvailability,
                 LastStatus: _lastStatus,
-                LastHResult: _lastHResult);
+                LastHResult: _lastHResult,
+                TotalNotCurrentlyAvailableRetries: Interlocked.Read(ref _totalNotCurrentlyAvailableRetries));
         }
     }
 
@@ -212,7 +215,7 @@ public sealed class DxgiScreenCaptureSource : IScreenCaptureSource, IDisposable
                 IDxgiDuplicationSession session;
                 try
                 {
-                    session = await _backend.OpenDuplicationSessionAsync(targetMonitor, ct).ConfigureAwait(false);
+                    session = await OpenDuplicationWithBoundedContentionRetryAsync(targetMonitor, ct).ConfigureAwait(false);
                 }
                 catch (DxgiCaptureException ex)
                 {
@@ -235,6 +238,7 @@ public sealed class DxgiScreenCaptureSource : IScreenCaptureSource, IDisposable
                     _activeMonitor = effectiveMonitor;
                     _requestedMonitorKey = monitorId.Trim();
                     _isCapturing = true;
+                    _hasPublishedInitialFrameInEpoch = false;
                     _surfaceAvailability = DesktopSurfaceAvailability.Available;
                     _lastStatus = DxgiCaptureStatus.Ok;
                     _lastHResult = DxgiHResult.SOk;
@@ -385,6 +389,7 @@ public sealed class DxgiScreenCaptureSource : IScreenCaptureSource, IDisposable
         CancellationToken linkedCt)
     {
         var recoveryAttempt = 0;
+        var notAvailableAttempt = 0;
 
         while (true)
         {
@@ -502,8 +507,44 @@ public sealed class DxgiScreenCaptureSource : IScreenCaptureSource, IDisposable
                         linkedCt).ConfigureAwait(false);
                     return null;
 
-                case DxgiCaptureStatus.UnsupportedOrUnavailable:
                 case DxgiCaptureStatus.MaxDuplicationClientsReached:
+                    if (notAvailableAttempt < _options.MaxNotCurrentlyAvailableRetries)
+                    {
+                        notAvailableAttempt++;
+                        var recoveredFromContention = await TryRecoverDuplicationUnderGateAsync(
+                            acquireResult.Status,
+                            acquireResult.HResult,
+                            linkedCt).ConfigureAwait(false);
+                        if (recoveredFromContention)
+                        {
+                            timeoutMs = Math.Min(timeoutMs, 50);
+                            continue;
+                        }
+
+                        // If recovery paused cleanly for Protected/Locked desktop or SessionDisconnected, return null fail-closed.
+                        DesktopSurfaceAvailability currentAvailability;
+                        lock (_stateLock)
+                        {
+                            currentAvailability = _surfaceAvailability;
+                        }
+
+                        if (currentAvailability is DesktopSurfaceAvailability.ProtectedOrLockedDesktop
+                            or DesktopSurfaceAvailability.SessionDisconnected)
+                        {
+                            return null;
+                        }
+                    }
+
+                    SetStatusLocked(
+                        DesktopSurfaceAvailability.Unavailable,
+                        acquireResult.Status,
+                        acquireResult.HResult);
+                    throw new DxgiCaptureException(
+                        acquireResult.Status,
+                        acquireResult.HResult,
+                        acquireResult.DiagnosticDetail ?? $"DXGI Desktop Duplication failed with non-recoverable status {acquireResult.Status} (0x{acquireResult.HResult:X8}).");
+
+                case DxgiCaptureStatus.UnsupportedOrUnavailable:
                 case DxgiCaptureStatus.MonitorNotFound:
                     SetStatusLocked(
                         DesktopSurfaceAvailability.Unavailable,
@@ -535,6 +576,12 @@ public sealed class DxgiScreenCaptureSource : IScreenCaptureSource, IDisposable
         callerCt.ThrowIfCancellationRequested();
         linkedCt.ThrowIfCancellationRequested();
 
+        bool emitInitialIdleFrame;
+        lock (_stateLock)
+        {
+            emitInitialIdleFrame = !_hasPublishedInitialFrameInEpoch;
+        }
+
         // Check if the frame itself reports a surface dimension or rotation change mid-session.
         var effectiveMonitor = monitor;
         if (frameData.SurfaceSize != pool.Size ||
@@ -560,12 +607,19 @@ public sealed class DxgiScreenCaptureSource : IScreenCaptureSource, IDisposable
             {
                 _activeMonitor = effectiveMonitor;
                 _framePool = pool;
+                _hasPublishedInitialFrameInEpoch = false;
+                emitInitialIdleFrame = true;
             }
         }
 
         var cursor = UpdateCursorStateUnderGate(frameData.PointerUpdate, frameData.SurfaceSize);
 
-        if (!frameData.HasDesktopImageUpdate)
+        var isCursorOnlySignal = frameData.PointerUpdate.PositionUpdated ||
+                                 frameData.PointerUpdate.NewShapeKind is not null;
+        var treatIdleInitialAsDesktopFrame = emitInitialIdleFrame && !isCursorOnlySignal;
+        var hasEffectiveDesktopUpdate = frameData.HasDesktopImageUpdate || treatIdleInitialAsDesktopFrame;
+
+        if (!hasEffectiveDesktopUpdate)
         {
             Interlocked.Increment(ref _totalCursorOnlyUpdates);
             if (!_options.EmitCursorOnlyFrames)
@@ -604,6 +658,7 @@ public sealed class DxgiScreenCaptureSource : IScreenCaptureSource, IDisposable
                 }
 
                 _surfaceAvailability = DesktopSurfaceAvailability.Available;
+                _hasPublishedInitialFrameInEpoch = true;
             }
 
             var rawDirtySpan = frameData.DirtyRects.Span;
@@ -612,8 +667,12 @@ public sealed class DxgiScreenCaptureSource : IScreenCaptureSource, IDisposable
             PixelRect[]? rotatedDirty = null;
             DxgiMoveRect[]? rotatedMoves = null;
 
-            if (effectiveMonitor.Rotation != DisplayRotation.Identity)
+            if (frameData.RectsInUnrotatedSpace && effectiveMonitor.Rotation != DisplayRotation.Identity)
             {
+                var unrotatedSize = DxgiGeometryNormalizer.GetUnrotatedSize(
+                    frameData.SurfaceSize,
+                    effectiveMonitor.Rotation);
+
                 if (rawDirtySpan.Length > 0)
                 {
                     rotatedDirty = new PixelRect[rawDirtySpan.Length];
@@ -621,7 +680,7 @@ public sealed class DxgiScreenCaptureSource : IScreenCaptureSource, IDisposable
                     {
                         rotatedDirty[i] = DxgiGeometryNormalizer.TransformRectForRotation(
                             rawDirtySpan[i],
-                            frameData.SurfaceSize,
+                            unrotatedSize,
                             effectiveMonitor.Rotation);
                     }
 
@@ -635,7 +694,7 @@ public sealed class DxgiScreenCaptureSource : IScreenCaptureSource, IDisposable
                     {
                         var transformedDest = DxgiGeometryNormalizer.TransformRectForRotation(
                             rawMoveSpan[i].DestinationRect,
-                            frameData.SurfaceSize,
+                            unrotatedSize,
                             effectiveMonitor.Rotation);
                         rotatedMoves[i] = new DxgiMoveRect(rawMoveSpan[i].SourceX, rawMoveSpan[i].SourceY, transformedDest);
                     }
@@ -644,16 +703,12 @@ public sealed class DxgiScreenCaptureSource : IScreenCaptureSource, IDisposable
                 }
             }
 
-            var targetBounds = effectiveMonitor.Rotation is DisplayRotation.Rotate90 or DisplayRotation.Rotate270
-                ? DxgiGeometryNormalizer.GetOrientedSize(frameData.SurfaceSize, effectiveMonitor.Rotation)
-                : frameData.SurfaceSize;
-
-            // Clamp normalized dirty rects so every rect fits within the leased frame's Size.
+            // Clamp normalized dirty rects so every rect fits strictly within the leased oriented frame's Size.
             var normalizedDirty = DxgiGeometryNormalizer.NormalizeDirtyRegions(
                 rawDirtySpan,
                 rawMoveSpan,
-                targetBounds == frameData.SurfaceSize ? frameData.SurfaceSize : targetBounds,
-                frameData.HasDesktopImageUpdate);
+                frameData.SurfaceSize,
+                hasEffectiveDesktopUpdate || _options.EmitCursorOnlyFrames);
 
             var rawQpc = frameData.PresentTimestampQpcTicks > 0
                 ? frameData.PresentTimestampQpcTicks
@@ -762,6 +817,14 @@ public sealed class DxgiScreenCaptureSource : IScreenCaptureSource, IDisposable
 
             await _backend.ResetAdapterResourcesAsync(ct).ConfigureAwait(false);
         }
+        else if (triggerStatus == DxgiCaptureStatus.MaxDuplicationClientsReached)
+        {
+            Interlocked.Increment(ref _totalNotCurrentlyAvailableRetries);
+            if (_options.NotCurrentlyAvailableRetryDelay > TimeSpan.Zero)
+            {
+                await DelayWithTimeProviderAsync(_options.NotCurrentlyAvailableRetryDelay, ct).ConfigureAwait(false);
+            }
+        }
         else
         {
             Interlocked.Increment(ref _totalAccessLostRecoveries);
@@ -792,7 +855,7 @@ public sealed class DxgiScreenCaptureSource : IScreenCaptureSource, IDisposable
         IDxgiDuplicationSession newSession;
         try
         {
-            newSession = await _backend.OpenDuplicationSessionAsync(resolvedMonitor, ct).ConfigureAwait(false);
+            newSession = await OpenDuplicationWithBoundedContentionRetryAsync(resolvedMonitor, ct).ConfigureAwait(false);
         }
         catch (DxgiCaptureException ex) when (
             ex.Status is DxgiCaptureStatus.AccessDeniedOrProtectedDesktop
@@ -801,7 +864,9 @@ public sealed class DxgiScreenCaptureSource : IScreenCaptureSource, IDisposable
             await HandleProtectedOrDisconnectedDesktopUnderGateAsync(ex.Status, ex.HResult, ct).ConfigureAwait(false);
             return false;
         }
-        catch (DxgiCaptureException ex) when (DxgiHResultClassifier.IsTransientRecoverable(ex.Status))
+        catch (DxgiCaptureException ex) when (
+            DxgiHResultClassifier.IsTransientRecoverable(ex.Status) ||
+            DxgiHResultClassifier.IsBoundedAvailabilityRetry(ex.Status))
         {
             RecordStatusLocked(ex.Status, ex.HResult);
             return false;
@@ -835,6 +900,7 @@ public sealed class DxgiScreenCaptureSource : IScreenCaptureSource, IDisposable
                     newSession.PixelFormat,
                     newSession.BackingKind,
                     _options.MaxPooledFrames);
+                _hasPublishedInitialFrameInEpoch = false;
             }
 
             _activeSession = newSession;
@@ -851,6 +917,34 @@ public sealed class DxgiScreenCaptureSource : IScreenCaptureSource, IDisposable
         }
 
         return true;
+    }
+
+    private async Task<IDxgiDuplicationSession> OpenDuplicationWithBoundedContentionRetryAsync(
+        MonitorDescriptor monitor,
+        CancellationToken ct)
+    {
+        var attempt = 0;
+        while (true)
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                return await _backend.OpenDuplicationSessionAsync(monitor, ct).ConfigureAwait(false);
+            }
+            catch (DxgiCaptureException ex) when (
+                DxgiHResultClassifier.IsBoundedAvailabilityRetry(ex.Status) &&
+                attempt < _options.MaxNotCurrentlyAvailableRetries)
+            {
+                attempt++;
+                Interlocked.Increment(ref _totalNotCurrentlyAvailableRetries);
+                RecordStatusLocked(ex.Status, ex.HResult);
+
+                if (_options.NotCurrentlyAvailableRetryDelay > TimeSpan.Zero)
+                {
+                    await DelayWithTimeProviderAsync(_options.NotCurrentlyAvailableRetryDelay, ct).ConfigureAwait(false);
+                }
+            }
+        }
     }
 
     private async ValueTask HandleProtectedOrDisconnectedDesktopUnderGateAsync(
