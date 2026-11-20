@@ -163,11 +163,7 @@ public sealed unsafe class WindowsDxgiAdapterBackend : IDxgiAdapterBackend
                                 continue;
                             }
 
-                            string deviceName;
-                            fixed (char* pDeviceName = outputDesc.DeviceName)
-                            {
-                                deviceName = ReadWideString(pDeviceName, 32);
-                            }
+                            var deviceName = ReadWideString(outputDesc.DeviceName, 32);
 
                             if (!MatchesMonitor(monitor, deviceName))
                             {
@@ -315,11 +311,7 @@ public sealed unsafe class WindowsDxgiAdapterBackend : IDxgiAdapterBackend
         uint adapterIndex,
         uint outputIndex)
     {
-        string deviceName;
-        fixed (char* pDeviceName = outputDesc.DeviceName)
-        {
-            deviceName = ReadWideString(pDeviceName, 32);
-        }
+        var deviceName = ReadWideString(outputDesc.DeviceName, 32);
 
         if (string.IsNullOrWhiteSpace(deviceName))
         {
@@ -406,11 +398,7 @@ public sealed unsafe class WindowsDxgiAdapterBackend : IDxgiAdapterBackend
 
         if (NativeDxgiInterop.EnumDisplayDevicesW(deviceName, 0, ref monitorDevice, 0))
         {
-            string monitorString;
-            fixed (char* pMonitor = monitorDevice.DeviceString)
-            {
-                monitorString = ReadWideString(pMonitor, 128);
-            }
+            var monitorString = ReadWideString(monitorDevice.DeviceString, 128);
 
             if (!string.IsNullOrWhiteSpace(monitorString))
             {
@@ -422,11 +410,7 @@ public sealed unsafe class WindowsDxgiAdapterBackend : IDxgiAdapterBackend
         adapterDevice.Cb = (uint)sizeof(NativeDxgiInterop.DisplayDeviceW);
         if (NativeDxgiInterop.EnumDisplayDevicesW(null, outputIndex, ref adapterDevice, 0))
         {
-            string adapterString;
-            fixed (char* pAdapter = adapterDevice.DeviceString)
-            {
-                adapterString = ReadWideString(pAdapter, 128);
-            }
+            var adapterString = ReadWideString(adapterDevice.DeviceString, 128);
 
             if (!string.IsNullOrWhiteSpace(adapterString))
             {
