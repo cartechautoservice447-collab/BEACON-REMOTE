@@ -648,11 +648,451 @@ public sealed class DxgiScreenCaptureSourceTests
         Assert.Equal(DesktopSurfaceAvailability.Unavailable, source.SurfaceAvailability);
     }
 
+    [Theory]
+    [InlineData(DisplayRotation.Identity)]
+    [InlineData(DisplayRotation.Rotate90)]
+    [InlineData(DisplayRotation.Rotate180)]
+    [InlineData(DisplayRotation.Rotate270)]
+    public void RotatePixelsPlacesDistinctPixelMarkersAtExactOrientedCoordinatesWithPaddedSourcePitch(
+        DisplayRotation rotation)
+    {
+        const int srcWidth = 3;
+        const int srcHeight = 2;
+        const int srcRowPitch = 256; // Simulated D3D11 staging pitch padding (> 3 * 4 = 12 bytes)
+        var unrotatedSize = new PixelSize(srcWidth, srcHeight);
+        var orientedSize = DxgiGeometryNormalizer.GetOrientedSize(unrotatedSize, rotation);
+
+        // Distinct BGRA pixel for each of the 6 coordinates (x, y) in 3x2 unrotated surface:
+        // (0,0)=P00, (1,0)=P10, (2,0)=P20
+        // (0,1)=P01, (1,1)=P11, (2,1)=P21
+        uint[,] markerPixels =
+        {
+            { 0x11223344u, 0x22334455u, 0x33445566u },
+            { 0x44556677u, 0x55667788u, 0x66778899u },
+        };
+
+        var srcBuffer = new byte[srcHeight * srcRowPitch];
+        for (var y = 0; y < srcHeight; y++)
+        {
+            for (var x = 0; x < srcWidth; x++)
+            {
+                WritePixel4Bpp(srcBuffer, y * srcRowPitch + x * 4, markerPixels[y, x]);
+            }
+        }
+
+        var dstRowPitch = orientedSize.Width * 4;
+        var dstBuffer = new byte[orientedSize.Height * dstRowPitch];
+
+        DxgiGeometryNormalizer.RotatePixels(
+            source: srcBuffer,
+            sourceWidth: srcWidth,
+            sourceHeight: srcHeight,
+            sourceRowPitchBytes: srcRowPitch,
+            destination: dstBuffer,
+            destinationRowPitchBytes: dstRowPitch,
+            bytesPerPixel: 4,
+            rotation: rotation);
+
+        // Every 1x1 pixel rect rotated via TransformRectForRotation must land at the exact same (dstX, dstY) pixel!
+        for (var y = 0; y < srcHeight; y++)
+        {
+            for (var x = 0; x < srcWidth; x++)
+            {
+                var transformedRect = DxgiGeometryNormalizer.TransformRectForRotation(
+                    new PixelRect(x, y, 1, 1),
+                    unrotatedSize,
+                    rotation);
+                Assert.Equal(1, transformedRect.Width);
+                Assert.Equal(1, transformedRect.Height);
+
+                var actualPixel = ReadPixel4Bpp(
+                    dstBuffer,
+                    transformedRect.Top * dstRowPitch + transformedRect.Left * 4);
+                Assert.Equal(markerPixels[y, x], actualPixel);
+            }
+        }
+    }
+
+    [Theory]
+    [InlineData(DxgiFormatValidator.DxgiFormatB8G8R8A8Unorm, true)]
+    [InlineData(DxgiFormatValidator.DxgiFormatB8G8R8A8UnormSrgb, true)]
+    [InlineData(DxgiFormatValidator.DxgiFormatR16G16B16A16Float, false)]
+    public void DuplicateOutputFormatValidatorAcceptsBgra8AndRejectsUnsupportedOrUnverifiedHdrFormats(
+        uint dxgiFormat,
+        bool shouldSucceed)
+    {
+        if (shouldSucceed)
+        {
+            var mapped = DxgiFormatValidator.ValidateDuplicateOutputFormat(dxgiFormat);
+            Assert.Equal(FramePixelFormat.Bgra8Unorm, mapped);
+            DxgiFormatValidator.EnsureSupportedSdrPixelFormat(mapped);
+            return;
+        }
+
+        var ex = Assert.Throws<DxgiCaptureException>(
+            () => DxgiFormatValidator.ValidateDuplicateOutputFormat(dxgiFormat));
+        Assert.Equal(DxgiCaptureStatus.UnsupportedOrUnavailable, ex.Status);
+        Assert.Equal(DxgiHResult.DxgiErrorUnsupported, ex.HResult);
+
+        var hdrEx = Assert.Throws<DxgiCaptureException>(
+            () => DxgiFormatValidator.EnsureSupportedSdrPixelFormat(FramePixelFormat.Rgba16Float));
+        Assert.Equal(DxgiCaptureStatus.UnsupportedOrUnavailable, hdrEx.Status);
+        Assert.Equal(DxgiHResult.DxgiErrorUnsupported, hdrEx.HResult);
+
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            DxgiGeometryNormalizer.RotatePixels(
+                source: new byte[64],
+                sourceWidth: 2,
+                sourceHeight: 2,
+                sourceRowPitchBytes: 16,
+                destination: new byte[64],
+                destinationRowPitchBytes: 16,
+                bytesPerPixel: 8,
+                rotation: DisplayRotation.Rotate90));
+    }
+
+    [Theory]
+    [InlineData(DisplayRotation.Identity)]
+    [InlineData(DisplayRotation.Rotate90)]
+    [InlineData(DisplayRotation.Rotate180)]
+    [InlineData(DisplayRotation.Rotate270)]
+    public async Task CaptureSourceDeliversOrientedPixelsAndOrientedDirtyRectsFromUnrotatedDxgiSurface(
+        DisplayRotation rotation)
+    {
+        var unrotatedSize = new PixelSize(4, 2);
+        var orientedSize = DxgiGeometryNormalizer.GetOrientedSize(unrotatedSize, rotation);
+        var rotatedMonitor = PrimaryMonitor with
+        {
+            DesktopBounds = new PixelRect(0, 0, orientedSize.Width, orientedSize.Height),
+            PhysicalSize = orientedSize,
+            Rotation = rotation,
+        };
+
+        var rawUnrotatedPixels = new byte[unrotatedSize.Width * unrotatedSize.Height * 4];
+        for (var y = 0; y < unrotatedSize.Height; y++)
+        {
+            for (var x = 0; x < unrotatedSize.Width; x++)
+            {
+                var color = 0xAA000000u | ((uint)(y + 1) << 16) | ((uint)(x + 1) << 8) | 0x5Au;
+                WritePixel4Bpp(rawUnrotatedPixels, (y * unrotatedSize.Width + x) * 4, color);
+            }
+        }
+
+        // Dirty rect in unrotated 4x2 surface space: (left=2, top=1, width=2, height=1).
+        var rawDirtyRect = new PixelRect(2, 1, 2, 1);
+
+        var backend = new FakeDxgiAdapterBackend([rotatedMonitor]);
+        var session = backend.GetOrCreateScriptedSession(rotatedMonitor);
+        session.EnqueueUnrotatedDesktopFrame(
+            qpcTicks: 5500,
+            unrotatedSize: unrotatedSize,
+            unrotatedDirtyRects: [rawDirtyRect],
+            pointer: new DxgiRawPointerUpdate(true, true, 1, 1),
+            unrotatedPixelBytes: rawUnrotatedPixels);
+
+        await using var source = new DxgiScreenCaptureSource(backend);
+        await source.StartCaptureAsync(rotatedMonitor.MonitorId);
+
+        using var frame = await source.AcquireNextFrameAsync(TimeSpan.FromMilliseconds(20));
+        Assert.NotNull(frame);
+        Assert.Equal(orientedSize, frame.Size);
+        Assert.Equal(orientedSize, frame.Monitor.PhysicalSize);
+        Assert.Equal(rotation, frame.Monitor.Rotation);
+
+        var expectedDirty = DxgiGeometryNormalizer.TransformRectForRotation(rawDirtyRect, unrotatedSize, rotation);
+        Assert.Single(frame.DirtyRects.ToArray());
+        Assert.Equal(expectedDirty, frame.DirtyRects.Span[0]);
+        Assert.True(frame.DirtyRects.Span[0].Right <= frame.Size.Width);
+        Assert.True(frame.DirtyRects.Span[0].Bottom <= frame.Size.Height);
+
+        var dstStride = orientedSize.Width * 4;
+        var copied = new byte[orientedSize.Height * dstStride];
+        await frame.ResourceLease.CopyToCpuBufferAsync(copied, dstStride);
+
+        // Verify the pixel inside the dirty corner (3, 1) landed at its exact rotated position.
+        var cornerMapped = DxgiGeometryNormalizer.TransformRectForRotation(
+            new PixelRect(3, 1, 1, 1),
+            unrotatedSize,
+            rotation);
+        var expectedCornerColor = ReadPixel4Bpp(rawUnrotatedPixels, (1 * unrotatedSize.Width + 3) * 4);
+        var actualCornerColor = ReadPixel4Bpp(copied, cornerMapped.Top * dstStride + cornerMapped.Left * 4);
+        Assert.Equal(expectedCornerColor, actualCornerColor);
+    }
+
+    [Fact]
+    public async Task StartCaptureFailsFastOnQuotaExhaustionAndDesktopIdentityPolicyEnforcesWinSta0Default()
+    {
+        var smallMonitor = PrimaryMonitor with { PhysicalSize = new PixelSize(4, 4) };
+        var backend = new FakeDxgiAdapterBackend([smallMonitor]);
+        backend.EnqueueOpenSessionFailure(
+            DxgiCaptureStatus.MaxDuplicationClientsReached,
+            DxgiHResult.DxgiErrorNotCurrentlyAvailable,
+            "4 duplication clients already active system-wide.");
+
+        var options = new DxgiScreenCaptureOptions
+        {
+            MaxNotCurrentlyAvailableRetries = 3,
+            NotCurrentlyAvailableRetryDelay = TimeSpan.Zero,
+        };
+
+        await using var source = new DxgiScreenCaptureSource(backend, options);
+
+        // Cold-start StartCaptureAsync has no prior session teardown from this instance, so 0x887A0022
+        // must fail fast with 0 retries instead of spinning against the 4-client system quota.
+        var ex = await Assert.ThrowsAsync<DxgiCaptureException>(
+            () => source.StartCaptureAsync(smallMonitor.MonitorId));
+        Assert.Equal(DxgiCaptureStatus.MaxDuplicationClientsReached, ex.Status);
+        Assert.Equal(DxgiHResult.DxgiErrorNotCurrentlyAvailable, ex.HResult);
+        Assert.False(source.IsCapturing);
+        Assert.Equal(DesktopSurfaceAvailability.Unavailable, source.SurfaceAvailability);
+        Assert.Equal(0, source.GetDiagnostics().TotalNotCurrentlyAvailableRetries);
+
+        // Verify initial GDI fallback desktop identity policy: only interactive WinSta0 + Default passes.
+        var validPreflight = DxgiDesktopIdentityPolicy.EvaluateInitialFallbackDesktop(
+            isUserInteractive: true,
+            isWindowStationVisible: true,
+            windowStationName: "WinSta0",
+            threadDesktopName: "Default",
+            preflightInputDesktopName: "Default");
+        Assert.True(validPreflight.IsInteractiveDefaultDesktop);
+
+        var validPostBitBlt = DxgiDesktopIdentityPolicy.EvaluateInitialFallbackDesktop(
+            isUserInteractive: true,
+            isWindowStationVisible: true,
+            windowStationName: "WinSta0",
+            threadDesktopName: "Default",
+            preflightInputDesktopName: "Default",
+            verifyPostCapture: true,
+            postCaptureThreadDesktopName: "Default",
+            postCaptureInputDesktopName: "Default");
+        Assert.True(validPostBitBlt.IsInteractiveDefaultDesktop);
+
+        // Fail closed on Winlogon, UAC Secure Desktop (null/inaccessible), Disconnect, non-interactive Session 0,
+        // and TOCTOU desktop switch between preflight ("Default") and post-BitBlt ("Winlogon" or null).
+        var winlogonCheck = DxgiDesktopIdentityPolicy.EvaluateInitialFallbackDesktop(
+            isUserInteractive: true,
+            isWindowStationVisible: true,
+            windowStationName: "WinSta0",
+            threadDesktopName: "Default",
+            preflightInputDesktopName: "Winlogon");
+        Assert.False(winlogonCheck.IsInteractiveDefaultDesktop);
+        Assert.Equal(DxgiCaptureStatus.AccessDeniedOrProtectedDesktop, winlogonCheck.Status);
+
+        var uacNullInputCheck = DxgiDesktopIdentityPolicy.EvaluateInitialFallbackDesktop(
+            isUserInteractive: true,
+            isWindowStationVisible: true,
+            windowStationName: "WinSta0",
+            threadDesktopName: "Default",
+            preflightInputDesktopName: null);
+        Assert.False(uacNullInputCheck.IsInteractiveDefaultDesktop);
+        Assert.Equal(DxgiCaptureStatus.AccessDeniedOrProtectedDesktop, uacNullInputCheck.Status);
+
+        var disconnectCheck = DxgiDesktopIdentityPolicy.EvaluateInitialFallbackDesktop(
+            isUserInteractive: true,
+            isWindowStationVisible: true,
+            windowStationName: "WinSta0",
+            threadDesktopName: "Default",
+            preflightInputDesktopName: "Disconnect");
+        Assert.False(disconnectCheck.IsInteractiveDefaultDesktop);
+        Assert.Equal(DxgiCaptureStatus.SessionDisconnected, disconnectCheck.Status);
+
+        var session0Check = DxgiDesktopIdentityPolicy.EvaluateInitialFallbackDesktop(
+            isUserInteractive: false,
+            isWindowStationVisible: false,
+            windowStationName: "Service-0x0-3e7$",
+            threadDesktopName: "Default",
+            preflightInputDesktopName: "Default");
+        Assert.False(session0Check.IsInteractiveDefaultDesktop);
+        Assert.Equal(DxgiCaptureStatus.SessionDisconnected, session0Check.Status);
+
+        var toctouSwitchCheck = DxgiDesktopIdentityPolicy.EvaluateInitialFallbackDesktop(
+            isUserInteractive: true,
+            isWindowStationVisible: true,
+            windowStationName: "WinSta0",
+            threadDesktopName: "Default",
+            preflightInputDesktopName: "Default",
+            verifyPostCapture: true,
+            postCaptureThreadDesktopName: "Default",
+            postCaptureInputDesktopName: "Winlogon");
+        Assert.False(toctouSwitchCheck.IsInteractiveDefaultDesktop);
+        Assert.Equal(DxgiCaptureStatus.AccessDeniedOrProtectedDesktop, toctouSwitchCheck.Status);
+    }
+
+    [Fact]
+    public async Task AcquireNextFrameRecoversFromTransientNotCurrentlyAvailableThenResumesFrames()
+    {
+        var smallMonitor = PrimaryMonitor with { PhysicalSize = new PixelSize(4, 4) };
+        var backend = new FakeDxgiAdapterBackend([smallMonitor]);
+        var session1 = backend.GetOrCreateScriptedSession(smallMonitor);
+        session1.EnqueueStatus(DxgiHResult.DxgiErrorNotCurrentlyAvailable);
+
+        var session2 = backend.EnqueueReplacementScriptedSession(smallMonitor);
+        session2.EnqueueDesktopFrame(
+            qpcTicks: 2200,
+            dirtyRects: [new PixelRect(0, 0, 4, 4)],
+            moveRects: [],
+            pointer: new DxgiRawPointerUpdate(false, true, 0, 0),
+            pixelBytes: new byte[4 * 4 * 4]);
+
+        var options = new DxgiScreenCaptureOptions
+        {
+            MaxNotCurrentlyAvailableRetries = 2,
+            NotCurrentlyAvailableRetryDelay = TimeSpan.Zero,
+        };
+
+        await using var source = new DxgiScreenCaptureSource(backend, options);
+        await source.StartCaptureAsync(smallMonitor.MonitorId);
+
+        using var recovered = await source.AcquireNextFrameAsync(TimeSpan.FromMilliseconds(20));
+        Assert.NotNull(recovered);
+        Assert.True(session1.IsDisposed);
+        Assert.Equal(1, source.GetDiagnostics().TotalNotCurrentlyAvailableRetries);
+        Assert.Equal(DesktopSurfaceAvailability.Available, source.SurfaceAvailability);
+    }
+
+    [Fact]
+    public async Task PersistentNotCurrentlyAvailableExhaustsBoundedRetriesAndFailsClosed()
+    {
+        var smallMonitor = PrimaryMonitor with { PhysicalSize = new PixelSize(4, 4) };
+        var backend = new FakeDxgiAdapterBackend([smallMonitor]);
+        var session1 = backend.GetOrCreateScriptedSession(smallMonitor);
+        session1.EnqueueStatus(DxgiHResult.DxgiErrorNotCurrentlyAvailable);
+
+        for (var i = 0; i < 6; i++)
+        {
+            backend.EnqueueOpenSessionFailure(
+                DxgiCaptureStatus.MaxDuplicationClientsReached,
+                DxgiHResult.DxgiErrorNotCurrentlyAvailable,
+                "4 duplication clients active.");
+        }
+
+        var options = new DxgiScreenCaptureOptions
+        {
+            MaxNotCurrentlyAvailableRetries = 2,
+            NotCurrentlyAvailableRetryDelay = TimeSpan.Zero,
+        };
+
+        await using var source = new DxgiScreenCaptureSource(backend, options);
+        await source.StartCaptureAsync(smallMonitor.MonitorId);
+
+        var ex = await Assert.ThrowsAsync<DxgiCaptureException>(
+            () => source.AcquireNextFrameAsync(TimeSpan.FromMilliseconds(20)));
+        Assert.Equal(DxgiCaptureStatus.MaxDuplicationClientsReached, ex.Status);
+        Assert.Equal(DxgiHResult.DxgiErrorNotCurrentlyAvailable, ex.HResult);
+        Assert.True(session1.IsDisposed);
+        Assert.False(source.IsCapturing);
+        Assert.Equal(DesktopSurfaceAvailability.Unavailable, source.SurfaceAvailability);
+        Assert.Equal(2, source.GetDiagnostics().TotalNotCurrentlyAvailableRetries);
+    }
+
+    [Fact]
+    public async Task NotCurrentlyAvailableTransitionToProtectedDesktopFailsClosedWithoutBypass()
+    {
+        var smallMonitor = PrimaryMonitor with { PhysicalSize = new PixelSize(4, 4) };
+        var backend = new FakeDxgiAdapterBackend([smallMonitor]);
+        var session1 = backend.GetOrCreateScriptedSession(smallMonitor);
+        session1.EnqueueStatus(DxgiHResult.DxgiErrorNotCurrentlyAvailable);
+
+        // Next reopen hits Winlogon / UAC Secure Desktop DXGI_ERROR_ACCESS_DENIED.
+        backend.EnqueueOpenSessionFailure(
+            DxgiCaptureStatus.AccessDeniedOrProtectedDesktop,
+            DxgiHResult.DxgiErrorAccessDenied,
+            "Secure desktop active.");
+
+        var sessionStateMachine = new SessionStateMachine();
+        var companionOptions = new CompanionOptions
+        {
+            ServerOrigin = new Uri("https://beacon.example.com"),
+            DeviceName = "LAPTOP-01",
+            RequireOwnerApprovalForFullControl = false,
+        };
+        _ = sessionStateMachine.BeginSession(
+            new SessionApprovalRequest(
+                Guid.NewGuid(),
+                Guid.NewGuid(),
+                PermissionMode.FullControl,
+                IsUnattendedAttempt: false,
+                DateTimeOffset.UtcNow),
+            companionOptions,
+            ownerExplicitlyApproved: true);
+
+        var options = new DxgiScreenCaptureOptions
+        {
+            MaxNotCurrentlyAvailableRetries = 2,
+            NotCurrentlyAvailableRetryDelay = TimeSpan.Zero,
+            ProtectedDesktopBackoffDelay = TimeSpan.Zero,
+        };
+
+        await using var source = new DxgiScreenCaptureSource(backend, options, sessionStateMachine);
+        await source.StartCaptureAsync(smallMonitor.MonitorId);
+
+        var frame = await source.AcquireNextFrameAsync(TimeSpan.FromMilliseconds(20));
+        Assert.Null(frame);
+        Assert.Equal(DesktopSurfaceAvailability.ProtectedOrLockedDesktop, source.SurfaceAvailability);
+        Assert.Equal(SessionState.LockedOrUnavailable, sessionStateMachine.State);
+        Assert.Equal(1, source.GetDiagnostics().TotalProtectedDesktopEvents);
+    }
+
+    [Fact]
+    public async Task InitialIdleFrameWithZeroPresentTimestampIsPublishedEvenWhenEmitCursorOnlyFramesIsFalse()
+    {
+        var smallMonitor = PrimaryMonitor with
+        {
+            DesktopBounds = new PixelRect(0, 0, 4, 2),
+            PhysicalSize = new PixelSize(4, 2),
+        };
+        var backend = new FakeDxgiAdapterBackend([smallMonitor]);
+        var session = backend.GetOrCreateScriptedSession(smallMonitor);
+
+        var initialPixels = new byte[4 * 2 * 4];
+        for (var i = 0; i < initialPixels.Length; i++)
+        {
+            initialPixels[i] = (byte)(0x40 + i);
+        }
+
+        // Frame 1: unchanged idle desktop (HasDesktopImageUpdate == false, PresentTimestampQpcTicks == 0, no pointer change).
+        session.EnqueueIdleFrame(initialPixels);
+
+        // Frame 2: subsequent cursor-only move must still be suppressed when EmitCursorOnlyFrames == false.
+        session.EnqueueCursorOnlyFrame(new DxgiRawPointerUpdate(true, true, 2, 1));
+
+        var options = new DxgiScreenCaptureOptions
+        {
+            EmitCursorOnlyFrames = false,
+        };
+
+        await using var source = new DxgiScreenCaptureSource(backend, options);
+        await source.StartCaptureAsync(smallMonitor.MonitorId);
+
+        using var initialFrame = await source.AcquireNextFrameAsync(TimeSpan.FromMilliseconds(20));
+        Assert.NotNull(initialFrame);
+        Assert.Equal(1, initialFrame.FrameSequence);
+        Assert.Single(initialFrame.DirtyRects.ToArray());
+        Assert.Equal(new PixelRect(0, 0, 4, 2), initialFrame.DirtyRects.Span[0]);
+
+        var copied = new byte[initialPixels.Length];
+        await initialFrame.ResourceLease.CopyToCpuBufferAsync(copied, 4 * 4);
+        Assert.Equal(initialPixels, copied);
+
+        var cursorTick = await source.AcquireNextFrameAsync(TimeSpan.FromMilliseconds(20));
+        Assert.Null(cursorTick);
+        Assert.Equal(1, source.GetDiagnostics().TotalCursorOnlyUpdates);
+        Assert.Equal(2, session.ReleaseFrameCallCount);
+    }
+
+    private static void WritePixel4Bpp(byte[] buffer, int offset, uint value) =>
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(buffer.AsSpan(offset, 4), value);
+
+    private static uint ReadPixel4Bpp(byte[] buffer, int offset) =>
+        System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(buffer.AsSpan(offset, 4));
+
     private sealed class FakeDxgiAdapterBackend : IDxgiAdapterBackend
     {
         private readonly Lock _gate = new();
         private readonly Dictionary<string, ScriptedDuplicationSession> _sessions =
             new(StringComparer.OrdinalIgnoreCase);
+        private readonly Queue<(DxgiCaptureStatus Status, int HResult, string Detail)> _openFailures = new();
+        private readonly Queue<ScriptedDuplicationSession> _queuedReplacementSessions = new();
         private IReadOnlyList<MonitorDescriptor> _monitors;
         private long _qpc = 10_000;
 
@@ -669,6 +1109,24 @@ public sealed class DxgiScreenCaptureSourceTests
             lock (_gate)
             {
                 _monitors = monitors;
+            }
+        }
+
+        public void EnqueueOpenSessionFailure(DxgiCaptureStatus status, int hResult, string detail)
+        {
+            lock (_gate)
+            {
+                _openFailures.Enqueue((status, hResult, detail));
+            }
+        }
+
+        public ScriptedDuplicationSession EnqueueReplacementScriptedSession(MonitorDescriptor monitor)
+        {
+            lock (_gate)
+            {
+                var session = new ScriptedDuplicationSession(monitor);
+                _queuedReplacementSessions.Enqueue(session);
+                return session;
             }
         }
 
@@ -712,6 +1170,17 @@ public sealed class DxgiScreenCaptureSourceTests
             ct.ThrowIfCancellationRequested();
             lock (_gate)
             {
+                if (_openFailures.TryDequeue(out var failure))
+                {
+                    throw new DxgiCaptureException(failure.Status, failure.HResult, failure.Detail);
+                }
+
+                if (_queuedReplacementSessions.TryDequeue(out var queuedReplacement))
+                {
+                    _sessions[monitor.MonitorId] = queuedReplacement;
+                    return Task.FromResult<IDxgiDuplicationSession>(queuedReplacement);
+                }
+
                 if (_sessions.TryGetValue(monitor.MonitorId, out var scripted) && !scripted.IsDisposed)
                 {
                     return Task.FromResult<IDxgiDuplicationSession>(scripted);
@@ -738,7 +1207,7 @@ public sealed class DxgiScreenCaptureSourceTests
 
     private sealed class ScriptedDuplicationSession : IDxgiDuplicationSession
     {
-        private readonly Queue<(DxgiAcquireAttemptResult Result, byte[]? PixelBytes, bool ThrowOnCopy)> _script = new();
+        private readonly Queue<(DxgiAcquireAttemptResult Result, byte[]? PixelBytes, bool ThrowOnCopy, PixelSize? UnrotatedSourceSize)> _script = new();
 
         public ScriptedDuplicationSession(MonitorDescriptor monitor)
         {
@@ -760,6 +1229,7 @@ public sealed class DxgiScreenCaptureSourceTests
 
         private byte[]? _currentPixelBytes;
         private bool _currentThrowOnCopy;
+        private PixelSize? _currentUnrotatedSourceSize;
 
         public void EnqueueDesktopFrame(
             long qpcTicks,
@@ -777,7 +1247,42 @@ public sealed class DxgiScreenCaptureSourceTests
                 DirtyRects: dirtyRects,
                 MoveRects: moveRects,
                 PointerUpdate: pointer);
-            _script.Enqueue((DxgiAcquireAttemptResult.Success(data), pixelBytes, false));
+            _script.Enqueue((DxgiAcquireAttemptResult.Success(data), pixelBytes, false, null));
+        }
+
+        public void EnqueueUnrotatedDesktopFrame(
+            long qpcTicks,
+            PixelSize unrotatedSize,
+            PixelRect[] unrotatedDirtyRects,
+            DxgiRawPointerUpdate pointer,
+            byte[] unrotatedPixelBytes)
+        {
+            var orientedSize = DxgiGeometryNormalizer.GetOrientedSize(unrotatedSize, SurfaceRotation);
+            var data = new DxgiAcquiredFrameData(
+                PresentTimestampQpcTicks: qpcTicks,
+                HasDesktopImageUpdate: true,
+                SurfaceSize: orientedSize,
+                PixelFormat: PixelFormat,
+                SurfaceRotation: SurfaceRotation,
+                DirtyRects: unrotatedDirtyRects,
+                MoveRects: ReadOnlyMemory<DxgiMoveRect>.Empty,
+                PointerUpdate: pointer,
+                RectsInUnrotatedSpace: SurfaceRotation != DisplayRotation.Identity);
+            _script.Enqueue((DxgiAcquireAttemptResult.Success(data), unrotatedPixelBytes, false, unrotatedSize));
+        }
+
+        public void EnqueueIdleFrame(byte[] pixelBytes)
+        {
+            var data = new DxgiAcquiredFrameData(
+                PresentTimestampQpcTicks: 0,
+                HasDesktopImageUpdate: false,
+                SurfaceSize: SurfaceSize,
+                PixelFormat: PixelFormat,
+                SurfaceRotation: SurfaceRotation,
+                DirtyRects: ReadOnlyMemory<PixelRect>.Empty,
+                MoveRects: ReadOnlyMemory<DxgiMoveRect>.Empty,
+                PointerUpdate: new DxgiRawPointerUpdate(false, true, 0, 0));
+            _script.Enqueue((DxgiAcquireAttemptResult.Success(data), pixelBytes, false, null));
         }
 
         public void EnqueueCursorOnlyFrame(DxgiRawPointerUpdate pointer)
@@ -791,7 +1296,7 @@ public sealed class DxgiScreenCaptureSourceTests
                 DirtyRects: ReadOnlyMemory<PixelRect>.Empty,
                 MoveRects: ReadOnlyMemory<DxgiMoveRect>.Empty,
                 PointerUpdate: pointer);
-            _script.Enqueue((DxgiAcquireAttemptResult.Success(data), null, false));
+            _script.Enqueue((DxgiAcquireAttemptResult.Success(data), null, false, null));
         }
 
         public void EnqueueCopyFaultingFrame()
@@ -805,14 +1310,14 @@ public sealed class DxgiScreenCaptureSourceTests
                 DirtyRects: new[] { new PixelRect(0, 0, SurfaceSize.Width, SurfaceSize.Height) },
                 MoveRects: ReadOnlyMemory<DxgiMoveRect>.Empty,
                 PointerUpdate: new DxgiRawPointerUpdate(false, true, 0, 0));
-            _script.Enqueue((DxgiAcquireAttemptResult.Success(data), null, true));
+            _script.Enqueue((DxgiAcquireAttemptResult.Success(data), null, true, null));
         }
 
         public void EnqueueWaitTimeout() =>
-            _script.Enqueue((DxgiAcquireAttemptResult.WaitTimeout(), null, false));
+            _script.Enqueue((DxgiAcquireAttemptResult.WaitTimeout(), null, false, null));
 
         public void EnqueueStatus(int hResult) =>
-            _script.Enqueue((DxgiAcquireAttemptResult.FromHResult(hResult), null, false));
+            _script.Enqueue((DxgiAcquireAttemptResult.FromHResult(hResult), null, false, null));
 
         public DxgiAcquireAttemptResult TryAcquireNextFrame(int timeoutMilliseconds)
         {
@@ -829,6 +1334,7 @@ public sealed class DxgiScreenCaptureSourceTests
                 IsFrameAcquired = true;
                 _currentPixelBytes = next.PixelBytes;
                 _currentThrowOnCopy = next.ThrowOnCopy;
+                _currentUnrotatedSourceSize = next.UnrotatedSourceSize;
             }
 
             return next.Result;
@@ -843,10 +1349,26 @@ public sealed class DxgiScreenCaptureSourceTests
             }
 
             var dst = slot.GetOrAllocateStagingBuffer(FrameBackingKind.GpuTexture);
-            if (_currentPixelBytes is not null)
+            if (_currentPixelBytes is null)
             {
-                _currentPixelBytes.AsSpan(0, Math.Min(_currentPixelBytes.Length, dst.Length)).CopyTo(dst);
+                return;
             }
+
+            if (_currentUnrotatedSourceSize is { } unrotatedSize)
+            {
+                DxgiGeometryNormalizer.RotatePixels(
+                    source: _currentPixelBytes,
+                    sourceWidth: unrotatedSize.Width,
+                    sourceHeight: unrotatedSize.Height,
+                    sourceRowPitchBytes: unrotatedSize.Width * slot.BytesPerPixel,
+                    destination: dst,
+                    destinationRowPitchBytes: slot.TightRowPitchBytes,
+                    bytesPerPixel: slot.BytesPerPixel,
+                    rotation: frameData.SurfaceRotation);
+                return;
+            }
+
+            _currentPixelBytes.AsSpan(0, Math.Min(_currentPixelBytes.Length, dst.Length)).CopyTo(dst);
         }
 
         public void ReleaseFrame()
@@ -856,6 +1378,7 @@ public sealed class DxgiScreenCaptureSourceTests
                 IsFrameAcquired = false;
                 _currentPixelBytes = null;
                 _currentThrowOnCopy = false;
+                _currentUnrotatedSourceSize = null;
                 ReleaseFrameCallCount++;
             }
         }
@@ -870,3 +1393,4 @@ public sealed class DxgiScreenCaptureSourceTests
         }
     }
 }
+

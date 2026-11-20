@@ -366,3 +366,148 @@ public sealed class DxgiCaptureException : Exception
 
     public DxgiCaptureStatus Status { get; }
 }
+
+/// <summary>
+/// Outcome of an interactive desktop identity verification check prior to and immediately after
+/// initial idle desktop fallback capture.
+/// </summary>
+public readonly record struct DxgiDesktopIdentityCheckResult(
+    bool IsAllowed,
+    DxgiCaptureStatus FailureStatus,
+    int FailureHResult,
+    string DiagnosticDetail);
+
+/// <summary>
+/// Fail-closed security policy verifying that initial idle desktop fallback capture executes strictly
+/// on the logged-in user's interactive <c>WinSta0\Default</c> desktop and never on <c>Winlogon</c>,
+/// UAC Secure Desktop, <c>Disconnect</c>, Session 0, or across a mid-capture desktop switch.
+/// </summary>
+public static class DxgiDesktopIdentityPolicy
+{
+    public const string InteractiveWindowStationName = "WinSta0";
+    public const string InteractiveDefaultDesktopName = "Default";
+
+    public static DxgiDesktopIdentityCheckResult EvaluateInitialFallbackDesktop(
+        bool isUserInteractive,
+        bool isWindowStationVisible,
+        string? windowStationName,
+        string? threadDesktopName,
+        string? preflightInputDesktopName,
+        bool verifyPostCapture = false,
+        string? postCaptureThreadDesktopName = null,
+        string? postCaptureInputDesktopName = null)
+    {
+        if (!isUserInteractive || !isWindowStationVisible)
+        {
+            return new DxgiDesktopIdentityCheckResult(
+                IsAllowed: false,
+                FailureStatus: DxgiCaptureStatus.SessionDisconnected,
+                FailureHResult: DxgiHResult.DxgiErrorSessionDisconnected,
+                DiagnosticDetail: "Initial idle fallback blocked: process or window station is non-interactive.");
+        }
+
+        if (!MatchesObjectName(windowStationName, InteractiveWindowStationName))
+        {
+            return new DxgiDesktopIdentityCheckResult(
+                IsAllowed: false,
+                FailureStatus: DxgiCaptureStatus.SessionDisconnected,
+                FailureHResult: DxgiHResult.DxgiErrorSessionDisconnected,
+                DiagnosticDetail: $"Initial idle fallback blocked: window station '{windowStationName ?? "<null>"}' is not '{InteractiveWindowStationName}'.");
+        }
+
+        if (!MatchesObjectName(threadDesktopName, InteractiveDefaultDesktopName))
+        {
+            return new DxgiDesktopIdentityCheckResult(
+                IsAllowed: false,
+                FailureStatus: DxgiCaptureStatus.AccessDeniedOrProtectedDesktop,
+                FailureHResult: DxgiHResult.DxgiErrorAccessDenied,
+                DiagnosticDetail: $"Initial idle fallback blocked: thread desktop '{threadDesktopName ?? "<null>"}' is not '{InteractiveDefaultDesktopName}'.");
+        }
+
+        if (!MatchesObjectName(preflightInputDesktopName, InteractiveDefaultDesktopName))
+        {
+            var isDisconnected = MatchesObjectName(preflightInputDesktopName, "Disconnect");
+            return new DxgiDesktopIdentityCheckResult(
+                IsAllowed: false,
+                FailureStatus: isDisconnected
+                    ? DxgiCaptureStatus.SessionDisconnected
+                    : DxgiCaptureStatus.AccessDeniedOrProtectedDesktop,
+                FailureHResult: isDisconnected
+                    ? DxgiHResult.DxgiErrorSessionDisconnected
+                    : DxgiHResult.DxgiErrorAccessDenied,
+                DiagnosticDetail: $"Initial idle fallback blocked: active input desktop '{preflightInputDesktopName ?? "<inaccessible>"}' is not '{InteractiveDefaultDesktopName}'.");
+        }
+
+        if (verifyPostCapture)
+        {
+            if (!MatchesObjectName(postCaptureThreadDesktopName, InteractiveDefaultDesktopName) ||
+                !MatchesObjectName(postCaptureInputDesktopName, InteractiveDefaultDesktopName))
+            {
+                var isDisconnected = MatchesObjectName(postCaptureInputDesktopName, "Disconnect");
+                return new DxgiDesktopIdentityCheckResult(
+                    IsAllowed: false,
+                    FailureStatus: isDisconnected
+                        ? DxgiCaptureStatus.SessionDisconnected
+                        : DxgiCaptureStatus.AccessDeniedOrProtectedDesktop,
+                    FailureHResult: isDisconnected
+                        ? DxgiHResult.DxgiErrorSessionDisconnected
+                        : DxgiHResult.DxgiErrorAccessDenied,
+                    DiagnosticDetail: $"Initial idle fallback aborted: desktop changed during capture to '{postCaptureInputDesktopName ?? "<inaccessible>"}' (thread='{postCaptureThreadDesktopName ?? "<null>"}').");
+            }
+        }
+
+        return new DxgiDesktopIdentityCheckResult(
+            IsAllowed: true,
+            FailureStatus: DxgiCaptureStatus.Ok,
+            FailureHResult: DxgiHResult.SOk,
+            DiagnosticDetail: string.Empty);
+    }
+
+    private static bool MatchesObjectName(string? actual, string expected)
+    {
+        if (string.IsNullOrWhiteSpace(actual))
+        {
+            return false;
+        }
+
+        var trimmed = actual.AsSpan().Trim().Trim('\0');
+        return trimmed.Equals(expected.AsSpan(), StringComparison.OrdinalIgnoreCase);
+    }
+}
+
+/// <summary>
+/// Validates native DXGI surface formats for Step 3.5 (<c>IDXGIOutput1::DuplicateOutput</c>).
+/// Standard <c>IDXGIOutput1::DuplicateOutput</c> provides 32-bit SDR <c>DXGI_FORMAT_B8G8R8A8_UNORM</c> (87)
+/// or <c>DXGI_FORMAT_B8G8R8A8_UNORM_SRGB</c> (91) surfaces (<see cref="FramePixelFormat.Bgra8Unorm"/>).
+/// Higher-bit-depth HDR duplication (<c>IDXGIOutput5::DuplicateOutput1</c> / <c>DXGI_FORMAT_R16G16B16A16_FLOAT</c>)
+/// is not implemented in Step 3.5 and is explicitly rejected rather than simulated via a format label.
+/// </summary>
+public static class DxgiFormatValidator
+{
+    public const uint DxgiFormatUnknown = 0;
+    public const uint DxgiFormatR16G16B16A16Float = 10;
+    public const uint DxgiFormatB8G8R8A8Unorm = 87;
+    public const uint DxgiFormatB8G8R8A8UnormSrgb = 91;
+
+    public static FramePixelFormat ValidateDuplicateOutputFormat(uint dxgiFormat) =>
+        dxgiFormat switch
+        {
+            DxgiFormatB8G8R8A8Unorm or DxgiFormatB8G8R8A8UnormSrgb => FramePixelFormat.Bgra8Unorm,
+            _ => throw new DxgiCaptureException(
+                DxgiCaptureStatus.UnsupportedOrUnavailable,
+                DxgiHResult.DxgiErrorUnsupported,
+                $"IDXGIOutput1::DuplicateOutput supports only 32-bit BGRA8 (DXGI_FORMAT_B8G8R8A8_UNORM=87 or _SRGB=91); native format {dxgiFormat} (including unimplemented IDXGIOutput5::DuplicateOutput1 HDR Rgba16Float) is unsupported in Step 3.5."),
+        };
+
+    public static void EnsureSupportedSdrPixelFormat(FramePixelFormat pixelFormat)
+    {
+        if (pixelFormat != FramePixelFormat.Bgra8Unorm)
+        {
+            throw new DxgiCaptureException(
+                DxgiCaptureStatus.UnsupportedOrUnavailable,
+                DxgiHResult.DxgiErrorUnsupported,
+                $"Step 3.5 IDXGIOutput1::DuplicateOutput supports only FramePixelFormat.Bgra8Unorm (32-bit SDR BGRA8); format '{pixelFormat}' is not implemented.");
+        }
+    }
+}
+

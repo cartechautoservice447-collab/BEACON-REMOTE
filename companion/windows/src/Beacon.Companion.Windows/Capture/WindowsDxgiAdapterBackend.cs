@@ -278,7 +278,9 @@ public sealed unsafe class WindowsDxgiAdapterBackend : IDxgiAdapterBackend
                 : fallbackRawSize.Height;
             var rawSurfaceSize = new PixelSize(Math.Max(1, rawWidth), Math.Max(1, rawHeight));
             var orientedSurfaceSize = DxgiGeometryNormalizer.GetOrientedSize(rawSurfaceSize, rotation);
-            var pixelFormat = NativeDxgiInterop.MapDxgiFormat(dupDesc.ModeDesc.Format);
+            var pixelFormat = dupDesc.ModeDesc.Format == DxgiFormatValidator.DxgiFormatUnknown
+                ? FramePixelFormat.Bgra8Unorm
+                : NativeDxgiInterop.MapDxgiFormat(dupDesc.ModeDesc.Format);
 
             var session = new WindowsDxgiDuplicationSession(
                 monitor,
@@ -500,7 +502,11 @@ public sealed unsafe class WindowsDxgiAdapterBackend : IDxgiAdapterBackend
                     var fallback = TryCaptureInitialIdleDesktopFrame();
                     if (fallback is not null)
                     {
-                        _hasEmittedInitialDesktopFrame = true;
+                        if (fallback.Status == DxgiCaptureStatus.Ok)
+                        {
+                            _hasEmittedInitialDesktopFrame = true;
+                        }
+
                         return fallback;
                     }
                 }
@@ -663,16 +669,6 @@ public sealed unsafe class WindowsDxgiAdapterBackend : IDxgiAdapterBackend
 
         private DxgiAcquireAttemptResult? TryCaptureInitialIdleDesktopFrame()
         {
-            // Strict fail-closed desktop isolation check: never attempt capture when the input desktop
-            // is locked, switched to Winlogon/UAC Secure Desktop, or running outside an interactive desktop.
-            var inputDesktop = NativeDxgiInterop.OpenInputDesktop(0, false, NativeDxgiInterop.DesktopReadObjects);
-            if (inputDesktop == 0)
-            {
-                return null;
-            }
-
-            _ = NativeDxgiInterop.CloseDesktop(inputDesktop);
-
             var width = SurfaceSize.Width;
             var height = SurfaceSize.Height;
             if (width <= 0 || height <= 0)
@@ -680,8 +676,9 @@ public sealed unsafe class WindowsDxgiAdapterBackend : IDxgiAdapterBackend
                 return null;
             }
 
-            var prevDpiCtx = NativeDxgiInterop.SetThreadDpiAwarenessContext(
-                NativeDxgiInterop.DpiAwarenessContextPerMonitorAwareV2);
+            nint preflightInputDesktop = 0;
+            nint postInputDesktop = 0;
+            var prevDpiCtx = (nint)0;
             nint screenDc = 0;
             nint memDc = 0;
             nint dibBitmap = 0;
@@ -689,6 +686,39 @@ public sealed unsafe class WindowsDxgiAdapterBackend : IDxgiAdapterBackend
 
             try
             {
+                // 1. Preflight desktop identity verification:
+                //    Do NOT rely on OpenInputDesktop() != 0 alone. Verify that the process window station
+                //    is interactive visible 'WinSta0', the calling thread desktop is 'Default', and the
+                //    active input desktop is 'Default' (never 'Winlogon', UAC Secure Desktop, or 'Disconnect').
+                var hWinSta = NativeDxgiInterop.GetProcessWindowStation();
+                var isWinStaVisible = NativeDxgiInterop.IsWindowStationInteractiveVisible(hWinSta);
+                var winStaName = NativeDxgiInterop.QueryUserObjectName(hWinSta);
+
+                var currentThreadId = NativeDxgiInterop.GetCurrentThreadId();
+                var hThreadDesktop = NativeDxgiInterop.GetThreadDesktop(currentThreadId);
+                var threadDesktopName = NativeDxgiInterop.QueryUserObjectName(hThreadDesktop);
+
+                preflightInputDesktop = NativeDxgiInterop.OpenInputDesktop(0, false, NativeDxgiInterop.DesktopReadObjects);
+                var preflightInputDesktopName = NativeDxgiInterop.QueryUserObjectName(preflightInputDesktop);
+
+                var preflightCheck = DxgiDesktopIdentityPolicy.EvaluateInitialFallbackDesktop(
+                    isUserInteractive: Environment.UserInteractive,
+                    isWindowStationVisible: isWinStaVisible,
+                    windowStationName: winStaName,
+                    threadDesktopName: threadDesktopName,
+                    preflightInputDesktopName: preflightInputDesktopName);
+                if (!preflightCheck.IsAllowed)
+                {
+                    return new DxgiAcquireAttemptResult(
+                        preflightCheck.FailureStatus,
+                        preflightCheck.FailureHResult,
+                        null,
+                        preflightCheck.DiagnosticDetail);
+                }
+
+                prevDpiCtx = NativeDxgiInterop.SetThreadDpiAwarenessContext(
+                    NativeDxgiInterop.DpiAwarenessContextPerMonitorAwareV2);
+
                 screenDc = NativeDxgiInterop.GetDC(0);
                 if (screenDc == 0)
                 {
@@ -745,6 +775,34 @@ public sealed unsafe class WindowsDxgiAdapterBackend : IDxgiAdapterBackend
                 var totalBytes = checked(width * height * 4);
                 var snapshot = new byte[totalBytes];
                 new ReadOnlySpan<byte>((void*)dibBits, totalBytes).CopyTo(snapshot);
+
+                // 2. Post-BitBlt desktop identity re-verification (TOCTOU guard):
+                //    Verify that the active input desktop and thread desktop remained 'Default' throughout BitBlt.
+                //    If a desktop switch to Winlogon/UAC/Disconnect occurred during BitBlt, zero the buffer and fail closed.
+                postInputDesktop = NativeDxgiInterop.OpenInputDesktop(0, false, NativeDxgiInterop.DesktopReadObjects);
+                var postInputDesktopName = NativeDxgiInterop.QueryUserObjectName(postInputDesktop);
+                var postThreadDesktopName = NativeDxgiInterop.QueryUserObjectName(
+                    NativeDxgiInterop.GetThreadDesktop(currentThreadId));
+
+                var postCheck = DxgiDesktopIdentityPolicy.EvaluateInitialFallbackDesktop(
+                    isUserInteractive: Environment.UserInteractive,
+                    isWindowStationVisible: isWinStaVisible,
+                    windowStationName: winStaName,
+                    threadDesktopName: threadDesktopName,
+                    preflightInputDesktopName: preflightInputDesktopName,
+                    verifyPostCapture: true,
+                    postCaptureThreadDesktopName: postThreadDesktopName,
+                    postCaptureInputDesktopName: postInputDesktopName);
+                if (!postCheck.IsAllowed)
+                {
+                    Array.Clear(snapshot);
+                    return new DxgiAcquireAttemptResult(
+                        postCheck.FailureStatus,
+                        postCheck.FailureHResult,
+                        null,
+                        postCheck.DiagnosticDetail);
+                }
+
                 var tightRowBytes = checked(width * 4);
 
                 var frameData = new DxgiAcquiredFrameData(
@@ -783,6 +841,16 @@ public sealed unsafe class WindowsDxgiAdapterBackend : IDxgiAdapterBackend
             }
             finally
             {
+                if (postInputDesktop != 0)
+                {
+                    _ = NativeDxgiInterop.CloseDesktop(postInputDesktop);
+                }
+
+                if (preflightInputDesktop != 0)
+                {
+                    _ = NativeDxgiInterop.CloseDesktop(preflightInputDesktop);
+                }
+
                 if (prevBitmap != 0 && memDc != 0)
                 {
                     _ = NativeDxgiInterop.SelectObject(memDc, prevBitmap);

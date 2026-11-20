@@ -212,13 +212,18 @@ public sealed class DxgiScreenCaptureSource : IScreenCaptureSource, IDisposable
                 oldCts.Dispose();
 
                 var newEpoch = Interlocked.Increment(ref _captureEpoch);
-                IDxgiDuplicationSession session;
+                IDxgiDuplicationSession? session = null;
                 try
                 {
-                    session = await OpenDuplicationWithBoundedContentionRetryAsync(targetMonitor, ct).ConfigureAwait(false);
+                    // Cold-start StartCaptureAsync does NOT retry DXGI_ERROR_NOT_CURRENTLY_AVAILABLE (0x887A0022):
+                    // when no active duplication handle was just released in-session, 0x887A0022 indicates
+                    // system-wide 4-client quota exhaustion and must fail fast without futile retries.
+                    session = await _backend.OpenDuplicationSessionAsync(targetMonitor, ct).ConfigureAwait(false);
+                    DxgiFormatValidator.EnsureSupportedSdrPixelFormat(session.PixelFormat);
                 }
                 catch (DxgiCaptureException ex)
                 {
+                    session?.Dispose();
                     HandleOpenSessionExceptionUnderGate(targetMonitor, ex);
                     throw;
                 }
@@ -508,31 +513,44 @@ public sealed class DxgiScreenCaptureSource : IScreenCaptureSource, IDisposable
                     return null;
 
                 case DxgiCaptureStatus.MaxDuplicationClientsReached:
-                    if (notAvailableAttempt < _options.MaxNotCurrentlyAvailableRetries)
+                    var recoveredFromContention = false;
+                    while (notAvailableAttempt < _options.MaxNotCurrentlyAvailableRetries)
                     {
                         notAvailableAttempt++;
-                        var recoveredFromContention = await TryRecoverDuplicationUnderGateAsync(
+                        recoveredFromContention = await TryRecoverDuplicationUnderGateAsync(
                             acquireResult.Status,
                             acquireResult.HResult,
                             linkedCt).ConfigureAwait(false);
                         if (recoveredFromContention)
                         {
-                            timeoutMs = Math.Min(timeoutMs, 50);
-                            continue;
+                            break;
                         }
 
-                        // If recovery paused cleanly for Protected/Locked desktop or SessionDisconnected, return null fail-closed.
                         DesktopSurfaceAvailability currentAvailability;
+                        DxgiCaptureStatus lastStatusAfterAttempt;
                         lock (_stateLock)
                         {
                             currentAvailability = _surfaceAvailability;
+                            lastStatusAfterAttempt = _lastStatus;
                         }
 
+                        // If recovery transitioned to Protected/Locked desktop or SessionDisconnected, return null fail-closed.
                         if (currentAvailability is DesktopSurfaceAvailability.ProtectedOrLockedDesktop
                             or DesktopSurfaceAvailability.SessionDisconnected)
                         {
                             return null;
                         }
+
+                        if (lastStatusAfterAttempt != DxgiCaptureStatus.MaxDuplicationClientsReached)
+                        {
+                            break;
+                        }
+                    }
+
+                    if (recoveredFromContention)
+                    {
+                        timeoutMs = Math.Min(timeoutMs, 50);
+                        continue;
                     }
 
                     SetStatusLocked(
@@ -575,6 +593,8 @@ public sealed class DxgiScreenCaptureSource : IScreenCaptureSource, IDisposable
     {
         callerCt.ThrowIfCancellationRequested();
         linkedCt.ThrowIfCancellationRequested();
+
+        DxgiFormatValidator.EnsureSupportedSdrPixelFormat(frameData.PixelFormat);
 
         bool emitInitialIdleFrame;
         lock (_stateLock)
@@ -852,15 +872,17 @@ public sealed class DxgiScreenCaptureSource : IScreenCaptureSource, IDisposable
             return false;
         }
 
-        IDxgiDuplicationSession newSession;
+        IDxgiDuplicationSession? newSession = null;
         try
         {
-            newSession = await OpenDuplicationWithBoundedContentionRetryAsync(resolvedMonitor, ct).ConfigureAwait(false);
+            newSession = await _backend.OpenDuplicationSessionAsync(resolvedMonitor, ct).ConfigureAwait(false);
+            DxgiFormatValidator.EnsureSupportedSdrPixelFormat(newSession.PixelFormat);
         }
         catch (DxgiCaptureException ex) when (
             ex.Status is DxgiCaptureStatus.AccessDeniedOrProtectedDesktop
                 or DxgiCaptureStatus.SessionDisconnected)
         {
+            newSession?.Dispose();
             await HandleProtectedOrDisconnectedDesktopUnderGateAsync(ex.Status, ex.HResult, ct).ConfigureAwait(false);
             return false;
         }
@@ -868,8 +890,14 @@ public sealed class DxgiScreenCaptureSource : IScreenCaptureSource, IDisposable
             DxgiHResultClassifier.IsTransientRecoverable(ex.Status) ||
             DxgiHResultClassifier.IsBoundedAvailabilityRetry(ex.Status))
         {
+            newSession?.Dispose();
             RecordStatusLocked(ex.Status, ex.HResult);
             return false;
+        }
+        catch
+        {
+            newSession?.Dispose();
+            throw;
         }
 
         var effectiveMonitor = SynchronizeMonitorWithSessionGeometry(resolvedMonitor, newSession);
@@ -917,34 +945,6 @@ public sealed class DxgiScreenCaptureSource : IScreenCaptureSource, IDisposable
         }
 
         return true;
-    }
-
-    private async Task<IDxgiDuplicationSession> OpenDuplicationWithBoundedContentionRetryAsync(
-        MonitorDescriptor monitor,
-        CancellationToken ct)
-    {
-        var attempt = 0;
-        while (true)
-        {
-            ct.ThrowIfCancellationRequested();
-            try
-            {
-                return await _backend.OpenDuplicationSessionAsync(monitor, ct).ConfigureAwait(false);
-            }
-            catch (DxgiCaptureException ex) when (
-                DxgiHResultClassifier.IsBoundedAvailabilityRetry(ex.Status) &&
-                attempt < _options.MaxNotCurrentlyAvailableRetries)
-            {
-                attempt++;
-                Interlocked.Increment(ref _totalNotCurrentlyAvailableRetries);
-                RecordStatusLocked(ex.Status, ex.HResult);
-
-                if (_options.NotCurrentlyAvailableRetryDelay > TimeSpan.Zero)
-                {
-                    await DelayWithTimeProviderAsync(_options.NotCurrentlyAvailableRetryDelay, ct).ConfigureAwait(false);
-                }
-            }
-        }
     }
 
     private async ValueTask HandleProtectedOrDisconnectedDesktopUnderGateAsync(

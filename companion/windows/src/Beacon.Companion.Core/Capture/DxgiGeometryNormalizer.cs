@@ -29,8 +29,8 @@ public static class DxgiGeometryNormalizer
     /// <summary>
     /// Rotates raw desktop surface pixels from unrotated panel coordinates (<paramref name="sourceWidth"/> x <paramref name="sourceHeight"/>)
     /// into upright oriented desktop coordinates matching <see cref="TransformRectForRotation"/>.
-    /// Supports both 4-byte (<see cref="FramePixelFormat.Bgra8Unorm"/>) and 8-byte (<see cref="FramePixelFormat.Rgba16Float"/>) pixels
-    /// as well as padded D3D11 staging row pitches.
+    /// Step 3.5 <c>IDXGIOutput1::DuplicateOutput</c> provides 4-byte (<see cref="FramePixelFormat.Bgra8Unorm"/>) SDR pixels
+    /// with potentially padded D3D11 staging row pitches.
     /// </summary>
     public static void RotatePixels(
         ReadOnlySpan<byte> source,
@@ -44,12 +44,12 @@ public static class DxgiGeometryNormalizer
     {
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(sourceWidth, 0);
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(sourceHeight, 0);
-        if (bytesPerPixel is not (4 or 8))
+        if (bytesPerPixel != 4)
         {
             throw new ArgumentOutOfRangeException(
                 nameof(bytesPerPixel),
                 bytesPerPixel,
-                "Only 4-byte (BGRA8) and 8-byte (RGBA16F) pixel formats are supported.");
+                "Step 3.5 IDXGIOutput1::DuplicateOutput supports only 4-byte (Bgra8Unorm) pixels.");
         }
 
         var sourceTightRowBytes = checked(sourceWidth * bytesPerPixel);
@@ -94,28 +94,14 @@ public static class DxgiGeometryNormalizer
             return;
         }
 
-        if (bytesPerPixel == 4)
-        {
-            RotatePixels4Bpp(
-                source,
-                sourceWidth,
-                sourceHeight,
-                sourceRowPitchBytes,
-                destination,
-                destinationRowPitchBytes,
-                rotation);
-        }
-        else
-        {
-            RotatePixels8Bpp(
-                source,
-                sourceWidth,
-                sourceHeight,
-                sourceRowPitchBytes,
-                destination,
-                destinationRowPitchBytes,
-                rotation);
-        }
+        RotatePixels4Bpp(
+            source,
+            sourceWidth,
+            sourceHeight,
+            sourceRowPitchBytes,
+            destination,
+            destinationRowPitchBytes,
+            rotation);
     }
 
     private static void RotatePixels4Bpp(
@@ -178,68 +164,6 @@ public static class DxgiGeometryNormalizer
                 throw new ArgumentOutOfRangeException(nameof(rotation), rotation, "Unsupported display rotation.");
         }
     }
-
-    private static void RotatePixels8Bpp(
-        ReadOnlySpan<byte> source,
-        int sourceWidth,
-        int sourceHeight,
-        int sourceRowPitchBytes,
-        Span<byte> destination,
-        int destinationRowPitchBytes,
-        DisplayRotation rotation)
-    {
-        switch (rotation)
-        {
-            case DisplayRotation.Rotate90:
-                for (var y = 0; y < sourceHeight; y++)
-                {
-                    var srcRowOffset = y * sourceRowPitchBytes;
-                    var dstXOffset = (sourceHeight - 1 - y) * 8;
-                    for (var x = 0; x < sourceWidth; x++)
-                    {
-                        var pixel = BinaryPrimitives.ReadUInt64LittleEndian(source.Slice(srcRowOffset + x * 8, 8));
-                        var dstOffset = x * destinationRowPitchBytes + dstXOffset;
-                        BinaryPrimitives.WriteUInt64LittleEndian(destination.Slice(dstOffset, 8), pixel);
-                    }
-                }
-
-                break;
-
-            case DisplayRotation.Rotate180:
-                for (var y = 0; y < sourceHeight; y++)
-                {
-                    var srcRowOffset = y * sourceRowPitchBytes;
-                    var dstRowOffset = (sourceHeight - 1 - y) * destinationRowPitchBytes;
-                    for (var x = 0; x < sourceWidth; x++)
-                    {
-                        var pixel = BinaryPrimitives.ReadUInt64LittleEndian(source.Slice(srcRowOffset + x * 8, 8));
-                        var dstOffset = dstRowOffset + (sourceWidth - 1 - x) * 8;
-                        BinaryPrimitives.WriteUInt64LittleEndian(destination.Slice(dstOffset, 8), pixel);
-                    }
-                }
-
-                break;
-
-            case DisplayRotation.Rotate270:
-                for (var y = 0; y < sourceHeight; y++)
-                {
-                    var srcRowOffset = y * sourceRowPitchBytes;
-                    var dstXOffset = y * 8;
-                    for (var x = 0; x < sourceWidth; x++)
-                    {
-                        var pixel = BinaryPrimitives.ReadUInt64LittleEndian(source.Slice(srcRowOffset + x * 8, 8));
-                        var dstOffset = (sourceWidth - 1 - x) * destinationRowPitchBytes + dstXOffset;
-                        BinaryPrimitives.WriteUInt64LittleEndian(destination.Slice(dstOffset, 8), pixel);
-                    }
-                }
-
-                break;
-
-            default:
-                throw new ArgumentOutOfRangeException(nameof(rotation), rotation, "Unsupported display rotation.");
-        }
-    }
-
 
     /// <summary>
     /// Transforms a rectangle from unrotated surface space into the rotated coordinate space defined by <paramref name="rotation"/>.

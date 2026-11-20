@@ -33,6 +33,9 @@ internal static unsafe class NativeDxgiInterop
     public const int MdtEffectiveDpi = 0;
 
     public const uint DesktopReadObjects = 0x0001;
+    public const int UoiFlags = 1;
+    public const int UoiName = 2;
+    public const uint WsfVisible = 0x0001;
     public static readonly nint DpiAwarenessContextPerMonitorAwareV2 = new(-4);
     public const uint SrcCopy = 0x00CC0020;
     public const uint CaptureBlt = 0x40000000;
@@ -248,6 +251,14 @@ internal static unsafe class NativeDxgiInterop
         public uint BmiColor0;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    public struct UserObjectFlags
+    {
+        public int FInherit;
+        public int FReserved;
+        public uint DwFlags;
+    }
+
     [DllImport("dxgi.dll", ExactSpelling = true)]
     public static extern int CreateDXGIFactory1(in Guid riid, out nint ppFactory);
 
@@ -300,6 +311,24 @@ internal static unsafe class NativeDxgiInterop
     [DllImport("user32.dll", ExactSpelling = true, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool CloseDesktop(nint hDesktop);
+
+    [DllImport("user32.dll", ExactSpelling = true, SetLastError = true)]
+    public static extern nint GetProcessWindowStation();
+
+    [DllImport("user32.dll", ExactSpelling = true, SetLastError = true)]
+    public static extern nint GetThreadDesktop(uint dwThreadId);
+
+    [DllImport("kernel32.dll", ExactSpelling = true)]
+    public static extern uint GetCurrentThreadId();
+
+    [DllImport("user32.dll", ExactSpelling = true, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool GetUserObjectInformationW(
+        nint hObj,
+        int nIndex,
+        void* pvInfo,
+        uint nLength,
+        out uint lpnLengthNeeded);
 
     [DllImport("user32.dll", ExactSpelling = true)]
     public static extern nint GetDC(nint hWnd);
@@ -558,9 +587,50 @@ internal static unsafe class NativeDxgiInterop
         };
 
     public static FramePixelFormat MapDxgiFormat(uint dxgiFormat) =>
-        dxgiFormat switch
+        DxgiFormatValidator.ValidateDuplicateOutputFormat(dxgiFormat);
+
+    public static string? QueryUserObjectName(nint hObj)
+    {
+        if (hObj == 0)
         {
-            DxgiFormatR16G16B16A16Float => FramePixelFormat.Rgba16Float,
-            _ => FramePixelFormat.Bgra8Unorm,
-        };
+            return null;
+        }
+
+        char* buffer = stackalloc char[128];
+        if (!GetUserObjectInformationW(hObj, UoiName, buffer, 128 * sizeof(char), out var neededBytes) ||
+            neededBytes < sizeof(char))
+        {
+            return null;
+        }
+
+        var maxChars = Math.Min(127, (int)(neededBytes / sizeof(char)));
+        var len = 0;
+        while (len < maxChars && buffer[len] != '\0')
+        {
+            len++;
+        }
+
+        return len == 0 ? null : new string(buffer, 0, len);
+    }
+
+    public static bool IsWindowStationInteractiveVisible(nint hWinSta)
+    {
+        if (hWinSta == 0)
+        {
+            return false;
+        }
+
+        UserObjectFlags flags = default;
+        if (!GetUserObjectInformationW(
+                hWinSta,
+                UoiFlags,
+                &flags,
+                (uint)sizeof(UserObjectFlags),
+                out _))
+        {
+            return false;
+        }
+
+        return (flags.DwFlags & WsfVisible) != 0;
+    }
 }
