@@ -342,7 +342,7 @@ public sealed class DxgiScreenCaptureSource : IScreenCaptureSource, IDisposable
             return;
         }
 
-        if (Interlocked.Read(ref _activeExecutions) == 0)
+        if (Volatile.Read(ref _activeExecutions) == 0)
         {
             _allExecutionsDrainedTcs.TrySetResult();
         }

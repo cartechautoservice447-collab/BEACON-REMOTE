@@ -541,6 +541,100 @@ public sealed class DxgiScreenCaptureSourceTests
     }
 
     [Fact]
+    public async Task LongRange64BitQpcTimestampPreservesPrecisionAndMonotonicClampingWithout32BitOverflow()
+    {
+        var smallMonitor = PrimaryMonitor with { PhysicalSize = new PixelSize(4, 4) };
+        var backend = new FakeDxgiAdapterBackend([smallMonitor]);
+        var session = backend.GetOrCreateScriptedSession(smallMonitor);
+        var pixels = new byte[4 * 4 * 4];
+
+        const long beyondInt32Qpc = (long)int.MaxValue + 5_000_000_000L;
+        const long regressedQpc = (long)int.MaxValue - 100L;
+        const long nearInt64MaxQpc = long.MaxValue - 10L;
+
+        session.EnqueueDesktopFrame(
+            qpcTicks: beyondInt32Qpc,
+            dirtyRects: [new PixelRect(0, 0, 4, 4)],
+            moveRects: [],
+            pointer: new DxgiRawPointerUpdate(false, true, 0, 0),
+            pixelBytes: pixels);
+
+        session.EnqueueDesktopFrame(
+            qpcTicks: regressedQpc,
+            dirtyRects: [new PixelRect(0, 0, 4, 4)],
+            moveRects: [],
+            pointer: new DxgiRawPointerUpdate(false, true, 0, 0),
+            pixelBytes: pixels);
+
+        session.EnqueueDesktopFrame(
+            qpcTicks: nearInt64MaxQpc,
+            dirtyRects: [new PixelRect(0, 0, 4, 4)],
+            moveRects: [],
+            pointer: new DxgiRawPointerUpdate(false, true, 0, 0),
+            pixelBytes: pixels);
+
+        await using var source = new DxgiScreenCaptureSource(backend);
+        await source.StartCaptureAsync(smallMonitor.MonitorId);
+
+        using var frame1 = await source.AcquireNextFrameAsync(TimeSpan.FromMilliseconds(10));
+        using var frame2 = await source.AcquireNextFrameAsync(TimeSpan.FromMilliseconds(10));
+        using var frame3 = await source.AcquireNextFrameAsync(TimeSpan.FromMilliseconds(10));
+
+        Assert.NotNull(frame1);
+        Assert.NotNull(frame2);
+        Assert.NotNull(frame3);
+
+        Assert.Equal(1, frame1.FrameSequence);
+        Assert.Equal(beyondInt32Qpc, frame1.TimestampQpcTicks);
+
+        Assert.Equal(2, frame2.FrameSequence);
+        Assert.Equal(beyondInt32Qpc, frame2.TimestampQpcTicks);
+
+        Assert.Equal(3, frame3.FrameSequence);
+        Assert.Equal(nearInt64MaxQpc, frame3.TimestampQpcTicks);
+        Assert.Equal(3, session.ReleaseFrameCallCount);
+    }
+
+    [Fact]
+    public async Task ConcurrentFrameAcquisitionsSerializeSafelyAndInFlightExecutionDrainsBeforeDisposeCompletes()
+    {
+        var smallMonitor = PrimaryMonitor with { PhysicalSize = new PixelSize(4, 4) };
+        var backend = new FakeDxgiAdapterBackend([smallMonitor]);
+        var session = backend.GetOrCreateScriptedSession(smallMonitor);
+        var pixels = new byte[4 * 4 * 4];
+
+        session.EnqueueDesktopFrame(
+            qpcTicks: 10_000,
+            dirtyRects: [new PixelRect(0, 0, 4, 4)],
+            moveRects: [],
+            pointer: new DxgiRawPointerUpdate(true, true, 1, 1),
+            pixelBytes: pixels);
+
+        session.EnqueueDesktopFrame(
+            qpcTicks: 20_000,
+            dirtyRects: [new PixelRect(0, 0, 4, 4)],
+            moveRects: [],
+            pointer: new DxgiRawPointerUpdate(true, true, 2, 2),
+            pixelBytes: pixels);
+
+        await using var source = new DxgiScreenCaptureSource(backend);
+        await source.StartCaptureAsync(smallMonitor.MonitorId);
+
+        var concurrentFrames = await Task.WhenAll(
+            source.AcquireNextFrameAsync(TimeSpan.FromMilliseconds(20)).AsTask(),
+            source.AcquireNextFrameAsync(TimeSpan.FromMilliseconds(20)).AsTask());
+
+        using var first = concurrentFrames[0];
+        using var second = concurrentFrames[1];
+
+        Assert.NotNull(first);
+        Assert.NotNull(second);
+        Assert.NotEqual(first.FrameSequence, second.FrameSequence);
+        Assert.Equal(2, session.ReleaseFrameCallCount);
+        Assert.Equal(2, source.GetDiagnostics().ActiveLeasedFrames);
+    }
+
+    [Fact]
     public async Task WindowsScreenCaptureFactoryCreatesValidSourceAndDisposesCleanly()
     {
         await using var source = WindowsScreenCaptureFactory.Create(
