@@ -15,7 +15,7 @@ namespace Beacon.Companion.DxgiSmokeTest;
 internal static partial class Program
 {
     private const uint DesktopReadObjects = 0x0001;
-    private const uint UoiName = 2;
+    private const int UoiName = 2;
 
     private static async Task<int> Main(string[] args)
     {
