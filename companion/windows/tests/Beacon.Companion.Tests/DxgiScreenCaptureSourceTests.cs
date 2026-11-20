@@ -854,7 +854,7 @@ public sealed class DxgiScreenCaptureSourceTests
             windowStationName: "WinSta0",
             threadDesktopName: "Default",
             preflightInputDesktopName: "Default");
-        Assert.True(validPreflight.IsInteractiveDefaultDesktop);
+        Assert.True(validPreflight.IsAllowed);
 
         var validPostBitBlt = DxgiDesktopIdentityPolicy.EvaluateInitialFallbackDesktop(
             isUserInteractive: true,
@@ -865,7 +865,7 @@ public sealed class DxgiScreenCaptureSourceTests
             verifyPostCapture: true,
             postCaptureThreadDesktopName: "Default",
             postCaptureInputDesktopName: "Default");
-        Assert.True(validPostBitBlt.IsInteractiveDefaultDesktop);
+        Assert.True(validPostBitBlt.IsAllowed);
 
         // Fail closed on Winlogon, UAC Secure Desktop (null/inaccessible), Disconnect, non-interactive Session 0,
         // and TOCTOU desktop switch between preflight ("Default") and post-BitBlt ("Winlogon" or null).
@@ -875,8 +875,8 @@ public sealed class DxgiScreenCaptureSourceTests
             windowStationName: "WinSta0",
             threadDesktopName: "Default",
             preflightInputDesktopName: "Winlogon");
-        Assert.False(winlogonCheck.IsInteractiveDefaultDesktop);
-        Assert.Equal(DxgiCaptureStatus.AccessDeniedOrProtectedDesktop, winlogonCheck.Status);
+        Assert.False(winlogonCheck.IsAllowed);
+        Assert.Equal(DxgiCaptureStatus.AccessDeniedOrProtectedDesktop, winlogonCheck.FailureStatus);
 
         var uacNullInputCheck = DxgiDesktopIdentityPolicy.EvaluateInitialFallbackDesktop(
             isUserInteractive: true,
@@ -884,8 +884,8 @@ public sealed class DxgiScreenCaptureSourceTests
             windowStationName: "WinSta0",
             threadDesktopName: "Default",
             preflightInputDesktopName: null);
-        Assert.False(uacNullInputCheck.IsInteractiveDefaultDesktop);
-        Assert.Equal(DxgiCaptureStatus.AccessDeniedOrProtectedDesktop, uacNullInputCheck.Status);
+        Assert.False(uacNullInputCheck.IsAllowed);
+        Assert.Equal(DxgiCaptureStatus.AccessDeniedOrProtectedDesktop, uacNullInputCheck.FailureStatus);
 
         var disconnectCheck = DxgiDesktopIdentityPolicy.EvaluateInitialFallbackDesktop(
             isUserInteractive: true,
@@ -893,8 +893,8 @@ public sealed class DxgiScreenCaptureSourceTests
             windowStationName: "WinSta0",
             threadDesktopName: "Default",
             preflightInputDesktopName: "Disconnect");
-        Assert.False(disconnectCheck.IsInteractiveDefaultDesktop);
-        Assert.Equal(DxgiCaptureStatus.SessionDisconnected, disconnectCheck.Status);
+        Assert.False(disconnectCheck.IsAllowed);
+        Assert.Equal(DxgiCaptureStatus.SessionDisconnected, disconnectCheck.FailureStatus);
 
         var session0Check = DxgiDesktopIdentityPolicy.EvaluateInitialFallbackDesktop(
             isUserInteractive: false,
@@ -902,8 +902,8 @@ public sealed class DxgiScreenCaptureSourceTests
             windowStationName: "Service-0x0-3e7$",
             threadDesktopName: "Default",
             preflightInputDesktopName: "Default");
-        Assert.False(session0Check.IsInteractiveDefaultDesktop);
-        Assert.Equal(DxgiCaptureStatus.SessionDisconnected, session0Check.Status);
+        Assert.False(session0Check.IsAllowed);
+        Assert.Equal(DxgiCaptureStatus.SessionDisconnected, session0Check.FailureStatus);
 
         var toctouSwitchCheck = DxgiDesktopIdentityPolicy.EvaluateInitialFallbackDesktop(
             isUserInteractive: true,
@@ -914,8 +914,8 @@ public sealed class DxgiScreenCaptureSourceTests
             verifyPostCapture: true,
             postCaptureThreadDesktopName: "Default",
             postCaptureInputDesktopName: "Winlogon");
-        Assert.False(toctouSwitchCheck.IsInteractiveDefaultDesktop);
-        Assert.Equal(DxgiCaptureStatus.AccessDeniedOrProtectedDesktop, toctouSwitchCheck.Status);
+        Assert.False(toctouSwitchCheck.IsAllowed);
+        Assert.Equal(DxgiCaptureStatus.AccessDeniedOrProtectedDesktop, toctouSwitchCheck.FailureStatus);
     }
 
     [Fact]
@@ -976,7 +976,7 @@ public sealed class DxgiScreenCaptureSourceTests
         await source.StartCaptureAsync(smallMonitor.MonitorId);
 
         var ex = await Assert.ThrowsAsync<DxgiCaptureException>(
-            () => source.AcquireNextFrameAsync(TimeSpan.FromMilliseconds(20)));
+            () => source.AcquireNextFrameAsync(TimeSpan.FromMilliseconds(20)).AsTask());
         Assert.Equal(DxgiCaptureStatus.MaxDuplicationClientsReached, ex.Status);
         Assert.Equal(DxgiHResult.DxgiErrorNotCurrentlyAvailable, ex.HResult);
         Assert.True(session1.IsDisposed);
